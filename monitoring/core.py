@@ -1,4 +1,4 @@
-"""Safe, bounded reads of the Milestone 4 lab runtime; no datapath changes."""
+"""Safe, bounded reads of the lab runtime directory; no datapath changes."""
 from __future__ import annotations
 
 from collections import deque
@@ -112,6 +112,7 @@ class Monitor:
             installed = status.get('installed_weights') or {}
             desired = status.get('desired_weights') or {}
             summary = status.get('backends') or {}
+            observed = status.get('observed_share') or {}
             status_age = max(0.0, now - finite_float(status.get('timestamp'), 0))
             controller_online = status_age < 8 and pid_alive(status.get('controller_pid'))
             servers = []
@@ -129,20 +130,22 @@ class Monitor:
                     'state': state.get('state', 'UNKNOWN') if controller_online else 'UNKNOWN',
                     'weight': int(installed.get(name, 0) or 0),
                     'desired_weight': int(desired.get(name, 0) or 0),
-                    'cpu_pct': round(finite_float(data.get('cpu_pct')), 2),
-                    'processing_ema_ms': round(finite_float(data.get('latency_ms')), 2),
-                    'active': int(finite_float(data.get('active'))),
-                    'completed': count, 'errors': int(finite_float(data.get('errors'))),
+                    # Load per worker as measured by the controller (rho).
+                    'load': (round(finite_float(state.get('load')), 3)
+                             if state.get('load') is not None else None),
+                    'response_ema_ms': round(finite_float(data.get('response_ms')), 2),
+                    'in_system': int(finite_float(data.get('in_system'))),
+                    'workers': int(finite_float(data.get('workers'))),
+                    'completed': count,
+                    'observed_share_pct': (round(100 * finite_float(observed.get(name)), 1)
+                                           if name in observed else None),
                     'telemetry_age_s': round(max(0., now - finite_float(data.get('timestamp'))), 1),
                     'probe_ok': health.get('ok') is True and
                          0 <= now - finite_float(health.get('timestamp')) < 5,
                     'probe_ms': round(finite_float(health.get('latency_ms')), 2),
                     'probe_error': str(health.get('error', '') or '')[:160],
                     'draining': name in drains,
-                    'workload': {
-                        'delay_ms': int(finite_float(baseline.get('delay_ms'))),
-                        'burn_ms': int(finite_float(baseline.get('burn_ms'))),
-                    },
+                    'workload': {'delay_ms': int(finite_float(baseline.get('delay_ms')))},
                 })
             delta = {n: 0 for n in NAMES}
             period = now - self._last_sample_at
@@ -167,7 +170,7 @@ class Monitor:
                 'desired_weights': desired,
             }
             self.history.append({'timestamp': now, 'rps': total_rate,
-                                 'cpu': {s['name']: s['cpu_pct'] for s in servers},
+                                 'load': {s['name']: s['load'] for s in servers},
                                  'weight': {s['name']: s['weight'] for s in servers}})
             active_job = read_dict(runtime / 'dashboard_traffic.json')
             benchmark_active = pid_alive(

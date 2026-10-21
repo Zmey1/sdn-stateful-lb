@@ -9,7 +9,9 @@ from pathlib import Path
 from .config import BACKENDS
 
 MODE_NAMES = ('adaptive', 'equal', 'capacity')
-STATIC_CAPACITY = {'b1': 50, 'b2': 125, 'b3': 125}
+# Oracle for the slow-b1 scenario: weights proportional to the true capacities
+# (b1 has one third of b2/b3). The adaptive policy must learn this unaided.
+STATIC_CAPACITY = {'b1': 42, 'b2': 129, 'b3': 129}
 
 
 def read_mode(runtime: Path) -> str:

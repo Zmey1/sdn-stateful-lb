@@ -49,7 +49,6 @@ class DrainRequest(BaseModel):
 class WorkloadRequest(BaseModel):
     backend: str
     delay_ms: int = Field(ge=0, le=350)
-    burn_ms: int = Field(ge=0, le=120)
 
 
 class TrafficRequest(BaseModel):
@@ -123,7 +122,7 @@ def create_app(runtime: Path, *, allow_controls=False,
         with control_lock:
             current = read_dict(runtime / 'workload_profile.json')
             # Keep all other backend profiles unchanged.
-            current[body.backend] = {'delay_ms': body.delay_ms, 'burn_ms': body.burn_ms}
+            current[body.backend] = {'delay_ms': body.delay_ms}
             atomic_json(runtime / 'workload_profile.json', current)
         return {'ok': True, 'backend': body.backend, 'profile': current[body.backend]}
 
@@ -162,7 +161,7 @@ def create_app(runtime: Path, *, allow_controls=False,
         verify_control(request)
         with control_lock:
             atomic_json(runtime / 'workload_profile.json',
-                        {name: {'delay_ms': 0, 'burn_ms': 0} for name in BACKEND_NAMES})
+                        {name: {'delay_ms': 0} for name in sorted(BACKEND_NAMES)})
             atomic_json(runtime / 'drain.json', [])
             atomic_json(runtime / 'benchmark_mode.json', {'mode': 'adaptive'})
         return {'ok': True, 'note': 'Requested adaptive mode; reset delays and drains'}

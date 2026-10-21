@@ -4,6 +4,8 @@ Health is measured by an independent Mininet p1 probe process. Controller
 restarts read existing group weights and cached health/policy state rather than
 reinstalling flows (which would disrupt established conntrack sessions).
 """
+from __future__ import annotations
+
 import argparse
 import fcntl
 import json
@@ -12,7 +14,7 @@ from pathlib import Path
 import time
 from .config import BACKENDS, BRIDGE
 from .runtime import atomic_json, read_dict, read_drains
-from .ofctl import read_installed_weights, update_weights, OpenFlowError
+from .ofctl import read_group_stats, read_installed_weights, update_weights, OpenFlowError
 from .policy import AdaptivePolicy, meaningful_change
 from .benchmark_modes import read_mode, select_weights
 
@@ -24,6 +26,27 @@ def read_metrics(directory: Path) -> dict[str, dict]:
 
 def read_health(directory: Path) -> dict[str, dict]:
     return read_dict(directory / 'health.json')
+
+
+def connection_shares(before: dict | None, after: dict | None,
+                      weights: dict[str, int]) -> dict[str, float] | None:
+    """Share of new connections the switch sent to each backend between two
+    group-stats readings, from SELECT bucket counters (only SYNs reach the
+    group). Bucket i is the i-th backend with a nonzero installed weight.
+    """
+    live = [b.name for b in BACKENDS if weights.get(b.name, 0) > 0]
+    if not before or not after or not live:
+        return None
+    old, new = before['bucket_counts'], after['bucket_counts']
+    if not len(old) == len(new) == len(live):
+        return None
+    deltas = [n - o for o, n in zip(old, new)]
+    total = sum(deltas)
+    if total <= 0 or min(deltas) < 0:
+        return None
+    shares = {b.name: 0.0 for b in BACKENDS}
+    shares.update({name: round(d / total, 3) for name, d in zip(live, deltas)})
+    return shares
 
 
 def initialize_policy(runtime: Path, installed: dict[str, int]) -> AdaptivePolicy:
@@ -89,8 +112,15 @@ def main():
         last_states = None
         last_mode = None
         mode_error = ''
+        last_counters = None
         try:
             while True:
+                try:
+                    counters = read_group_stats(args.bridge)
+                except OpenFlowError:
+                    counters = None
+                observed = connection_shares(last_counters, counters, previous)
+                last_counters = counters
                 policy.manual_drain = read_drains(args.runtime)
                 health = read_health(args.runtime)
                 adaptive_weights = policy.evaluate(read_metrics(args.runtime), health=health)
@@ -115,6 +145,7 @@ def main():
                         previous = dict(desired)
                         last_update = time.monotonic()
                         updated = True
+                        last_counters = None  # buckets were rebuilt
                     except OpenFlowError as exc:
                         print(f'OpenFlow update failed: {exc}', flush=True)
                         # Resync to switch as source of truth if command
@@ -123,6 +154,7 @@ def main():
                             previous = read_installed_weights(args.bridge)
                         except OpenFlowError:
                             pass
+                        last_counters = None
                 # Remember a mode only after its desired weights are installed.
                 # If an update fails, retry on the next controller iteration.
                 if previous == desired:
@@ -139,6 +171,7 @@ def main():
                 atomic_json(args.runtime / 'status.json', {
                     'timestamp': time.time(), 'controller_pid': os.getpid(),
                     'installed_weights': previous, 'desired_weights': desired,
+                    'observed_share': observed,
                     'benchmark_mode': benchmark_mode, 'mode_error': mode_error,
                     'backends': summary,
                 })

@@ -10,6 +10,12 @@ BACKEND_GW = '10.0.2.1'
 CT_ZONE = 10
 GROUP_ID = 100
 
+# Emulated server capacity: each backend serves at most WORKERS requests at
+# once, each holding a worker for SERVICE_MS (plus any injected delay); the
+# rest queue. Capacity = WORKERS / SERVICE_MS = 80 requests/s per backend.
+BACKEND_WORKERS = 4
+BACKEND_SERVICE_MS = 50
+
 
 @dataclass(frozen=True)
 class Endpoint:

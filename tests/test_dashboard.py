@@ -18,15 +18,16 @@ def runtime(tmp_path):
         'timestamp': now, 'controller_pid': os.getpid(), 'benchmark_mode': 'adaptive',
         'installed_weights': {'b1': 100, 'b2': 100, 'b3': 100},
         'desired_weights': {'b1': 100, 'b2': 100, 'b3': 100},
-        'backends': {n: {'state': 'HEALTHY'} for n in ('b1', 'b2', 'b3')},
+        'backends': {n: {'state': 'HEALTHY', 'load': 0.42} for n in ('b1', 'b2', 'b3')},
+        'observed_share': {'b1': 0.2, 'b2': 0.4, 'b3': 0.4},
     }))
     (tmp_path / 'health.json').write_text(json.dumps({
         n: {'timestamp': now, 'ok': True, 'latency_ms': 1.8} for n in ('b1','b2','b3')
     }))
     for n in ('b1','b2','b3'):
         (tmp_path / f'{n}.json').write_text(json.dumps({
-            'timestamp': now, 'cpu_pct': 22, 'latency_ms': 9,
-            'active': 1, 'completed': 20, 'errors': 0,
+            'timestamp': now, 'response_ms': 9, 'in_system': 1, 'workers': 4,
+            'arrived': 20, 'busy_s': 1.0, 'completed': 20,
         }))
     return tmp_path
 
@@ -43,7 +44,9 @@ def test_dashboard_reads_real_status(runtime, monkeypatch):
         assert data['controls_enabled'] is False
         assert len(data['backends']) == 3
         assert all(x['probe_ok'] for x in data['backends'])
-        assert data['backends'][0]['processing_ema_ms'] == 9
+        assert data['backends'][0]['response_ema_ms'] == 9
+        assert data['backends'][0]['load'] == 0.42
+        assert data['backends'][0]['observed_share_pct'] == 20
 
 
 def test_no_controls_unless_opted_in(runtime, monkeypatch):
@@ -62,13 +65,13 @@ def test_controls_write_only_bounded_known_files(runtime, monkeypatch):
         assert client.post('/api/control/mode',json={'mode':'not-an-option'}).status_code == 400
         assert client.post('/api/control/drain',json={'backend':'b1','enabled':True}).status_code == 200
         assert json.loads((runtime/'drain.json').read_text()) == ['b1']
-        assert client.post('/api/control/workload',json={'backend':'b1','delay_ms':160,'burn_ms':75}).status_code == 200
-        assert client.post('/api/control/workload',json={'backend':'b2','delay_ms':400,'burn_ms':0}).status_code == 422
-        assert client.post('/api/control/workload',json={'backend':'../../etc','delay_ms':0,'burn_ms':0}).status_code == 400
+        assert client.post('/api/control/workload',json={'backend':'b1','delay_ms':160}).status_code == 200
+        assert client.post('/api/control/workload',json={'backend':'b2','delay_ms':400}).status_code == 422
+        assert client.post('/api/control/workload',json={'backend':'../../etc','delay_ms':0}).status_code == 400
         assert client.post('/api/control/reset',json={}).status_code == 200
         assert json.loads((runtime/'drain.json').read_text()) == []
         assert json.loads((runtime/'benchmark_mode.json').read_text()) == {'mode':'adaptive'}
-        assert json.loads((runtime/'workload_profile.json').read_text())['b1']['burn_ms'] == 0
+        assert json.loads((runtime/'workload_profile.json').read_text())['b1']['delay_ms'] == 0
 
 
 def test_control_rejects_other_browser_origins(runtime, monkeypatch):
@@ -100,7 +103,7 @@ def test_stale_controller_blocks_controls(runtime, monkeypatch):
 def test_benchmark_csv_loading(runtime):
     folder=runtime/'bench_results'/'20261011T211533Z'
     folder.mkdir(parents=True)
-    (folder/'summary.csv').write_text('scenario,mode,runs,p95_ms,throughput_rps\ncpu-b1,adaptive,3,90.758,60\n')
+    (folder/'summary.csv').write_text('scenario,mode,runs,p95_ms,throughput_rps\nslow-b1,adaptive,3,90.758,60\n')
     result=benchmark_data(runtime/'bench_results')
     assert result['available']
     assert result['summary'][0]['p95_ms']==90.758

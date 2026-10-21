@@ -49,3 +49,13 @@ def test_reject_invalid_weights():
     with pytest.raises(ValueError): group_text({'b4': 100})
     with pytest.raises(ValueError): group_text({'b1': -1})
     with pytest.raises(ValueError): group_text({'b1': 70000})
+
+
+def test_parse_group_stats_bucket_counters():
+    from controller.ofctl import parse_group_stats
+    text = ('OFPST_GROUP reply (OF1.3) (xid=0x2):\n'
+            ' group_id=100,duration=12.3s,ref_count=3,packet_count=30,byte_count=1980,'
+            'bucket0:packet_count=10,byte_count=660,bucket1:packet_count=20,byte_count=1320\n')
+    assert parse_group_stats(text) == {'packet_count': 30, 'bucket_counts': [10, 20]}
+    assert parse_group_stats('group_id=7,packet_count=1') == {'packet_count': None,
+                                                             'bucket_counts': []}

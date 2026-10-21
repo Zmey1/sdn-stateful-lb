@@ -7,7 +7,7 @@ from controller.config import ALL, BACKENDS
 from controller.health_probe import probe_backend
 from controller.ofctl import OpenFlowError, parse_installed_weights
 from controller.policy import AdaptivePolicy
-from controller.policy_loop import initialize_policy, read_health
+from controller.policy_loop import connection_shares, initialize_policy, read_health
 
 
 def checks(now, b1=True, b2=True, b3=True):
@@ -120,3 +120,13 @@ def test_health_file_missing_is_unhealthy(tmp_path):
     assert read_health(tmp_path) == {}
     (tmp_path / 'health.json').write_text('{bad')
     assert read_health(tmp_path) == {}
+
+
+def test_connection_shares_from_select_bucket_counters():
+    weights = {'b1': 0, 'b2': 150, 'b3': 150}
+    before = {'packet_count': 10, 'bucket_counts': [4, 6]}
+    after = {'packet_count': 50, 'bucket_counts': [14, 36]}
+    assert connection_shares(before, after, weights) == {'b1': 0.0, 'b2': 0.25, 'b3': 0.75}
+    assert connection_shares(None, after, weights) is None
+    assert connection_shares(before, before, weights) is None  # no traffic
+    assert connection_shares(before, {'bucket_counts': [1, 2, 3]}, weights) is None

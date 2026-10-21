@@ -16,6 +16,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from controller.benchmark_modes import MODE_NAMES
 from controller.policy import meaningful_change
@@ -23,7 +24,9 @@ from controller.config import BACKENDS, CLIENTS
 from controller.ofctl import OpenFlowError, ovs
 from controller.runtime import atomic_json as write_json, read_dict
 
-SCENARIOS = ('uniform', 'degraded-b1', 'cpu-b1')
+SCENARIOS = ('uniform', 'slow-b1', 'step-b1')
+# 100 ms extra service time triples b1's 50 ms service: one third capacity.
+SLOW_DELAY_MS = 100
 
 
 def read_json(path: Path) -> dict:
@@ -94,16 +97,36 @@ def wait_for_mode(runtime: Path, mode: str, timeout=18):
                        f'Check {runtime / "controller.log"}')
 
 
-def scenario_profile(scenario):
+def profile(slow: set[str] = frozenset()) -> dict:
+    return {b.name: {'delay_ms': SLOW_DELAY_MS if b.name in slow else 0}
+            for b in BACKENDS}
+
+
+def scenario_schedule(scenario: str, warmup: float, duration: float):
+    """[(seconds after load starts, workload profile)], first entry at 0.
+
+    step-b1 slows b1 a third of the way into the measurement and restores it
+    at two thirds, so the timeline shows the controller adapting both ways.
+    """
     if scenario == 'uniform':
-        return {b.name: {'delay_ms': 0, 'burn_ms': 0} for b in BACKENDS}
-    if scenario == 'degraded-b1':
-        return {b.name: {'delay_ms': 160 if b.name == 'b1' else 0,
-                         'burn_ms': 0} for b in BACKENDS}
-    if scenario == 'cpu-b1':
-        return {b.name: {'delay_ms': 0,
-                         'burn_ms': 75 if b.name == 'b1' else 0} for b in BACKENDS}
+        return [(0, profile())]
+    if scenario == 'slow-b1':
+        return [(0, profile({'b1'}))]
+    if scenario == 'step-b1':
+        return [(0, profile()), (warmup + duration / 3, profile({'b1'})),
+                (warmup + 2 * duration / 3, profile())]
     raise ValueError(scenario)
+
+
+def record_timeline(runtime: Path, stop: threading.Event, samples: list):
+    """Installed weights and measured loads, once per second during load."""
+    start = time.monotonic()
+    while not stop.wait(1.0):
+        status = read_dict(runtime / 'status.json')
+        samples.append({'t': round(time.monotonic() - start, 1),
+                        'weights': status.get('installed_weights'),
+                        'load': {n: (s or {}).get('load') for n, s in
+                                 (status.get('backends') or {}).items()}})
 
 
 def client_command(pid: int, rate: float, args):
@@ -184,13 +207,14 @@ def main():
     p.add_argument('--duration', type=float, default=15, help='measurement seconds')
     p.add_argument('--warmup', type=float, default=6)
     p.add_argument('--settle', type=float, default=8)
-    p.add_argument('--qps', type=float, default=60, help='total offered HTTP requests/s')
+    p.add_argument('--qps', type=float, default=150,
+                   help='total offered HTTP requests/s (cluster capacity is 240)')
     p.add_argument('--repeats', type=int, default=1)
     p.add_argument('--max-inflight', type=int, default=50, help='per client')
     p.add_argument('--timeout', type=float, default=3)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--modes', nargs='+', choices=MODE_NAMES, default=list(MODE_NAMES))
-    p.add_argument('--scenarios', nargs='+', choices=SCENARIOS, default=['uniform', 'degraded-b1'])
+    p.add_argument('--scenarios', nargs='+', choices=SCENARIOS, default=list(SCENARIOS))
     args = p.parse_args()
     if os.geteuid():
         p.error('Run with sudo; nsenter needs root privileges')
@@ -200,11 +224,11 @@ def main():
         p.error('nsenter missing (install util-linux)')
     runtime = args.runtime.resolve()
     if not (runtime / 'host_pids.json').exists():
-        p.error('Must start the Milestone 4 Mininet lab first')
-    # Require a current Milestone 4 controller, never silently benchmark M3.
+        p.error('Start the Mininet lab first (./start_dev.sh)')
+    # Require a live controller that understands benchmark modes.
     status = controller_snapshot(runtime)
     if 'benchmark_mode' not in status or time.time() - status.get('timestamp', 0) > 8:
-        p.error('No live Milestone 4 controller: use --adaptive on the updated lab')
+        p.error('No live policy controller: start the lab with --adaptive')
     root = runtime / 'bench_results' / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     root.mkdir(parents=True, exist_ok=True)
     write_json(runtime / 'benchmark_active.json', {'pid': os.getpid(), 'started': time.time()})
@@ -215,11 +239,12 @@ def main():
     try:
         for scenario in args.scenarios:
             print(f'\nSCENARIO: {scenario}', flush=True)
-            write_json(runtime / 'workload_profile.json', scenario_profile(scenario))
+            schedule = scenario_schedule(scenario, args.warmup, args.duration)
             combinations = [(mode, repeat) for repeat in range(1, args.repeats+1)
                             for mode in args.modes]
             rng.shuffle(combinations)
             for mode, repeat in combinations:
+                write_json(runtime / 'workload_profile.json', schedule[0][1])
                 write_json(runtime / 'benchmark_mode.json', {'mode': mode})
                 wait_for_mode(runtime, mode)
                 if args.settle:
@@ -230,7 +255,22 @@ def main():
                 telemetry_before = backend_telemetry(runtime)
                 print(f'  {mode} run {repeat}: weights={before.get("installed_weights")}',
                       flush=True)
-                clients = run_load(runtime, args)
+                timers = [threading.Timer(delay, write_json,
+                                          (runtime / 'workload_profile.json', item))
+                          for delay, item in schedule[1:]]
+                timeline, stop = [], threading.Event()
+                recorder = threading.Thread(target=record_timeline,
+                                            args=(runtime, stop, timeline))
+                recorder.start()
+                for timer in timers:
+                    timer.start()
+                try:
+                    clients = run_load(runtime, args)
+                finally:
+                    stop.set()
+                    for timer in timers:
+                        timer.cancel()
+                    recorder.join()
                 after = controller_snapshot(runtime)
                 ctl_cpu_after = process_cpu_seconds(after.get('controller_pid'))
                 stats_after = group_stats()
@@ -251,7 +291,7 @@ def main():
                             'ovs_group_stats_after': stats_after,
                             'telemetry_before': telemetry_before,
                             'telemetry_after': telemetry_after,
-                            'clients': clients}
+                            'timeline': timeline, 'clients': clients}
                 write_json(root / f'{scenario}_{mode}_{repeat}.json', artifact)
                 write_table(root / 'runs.csv', rows)
                 print(f'    success={metrics["success"]}/{metrics["offered"]}, '
@@ -280,7 +320,7 @@ def main():
         if read_dict(active).get('pid') == os.getpid():
             active.unlink(missing_ok=True)
         # Restore safe defaults, even if one experiment fails.
-        write_json(runtime / 'workload_profile.json', scenario_profile('uniform'))
+        write_json(runtime / 'workload_profile.json', profile())
         write_json(runtime / 'benchmark_mode.json', {'mode': 'adaptive'})
 
 
