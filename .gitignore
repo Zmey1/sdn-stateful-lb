@@ -1,0 +1,22 @@
+# Generated Python files and tooling caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local development state and preserved backups
+.dev/
+
+.venv/
+.venv-dashboard/
+
+# User-exported metrics and experiments
+recorded_runs/
+*.log
+
+# Local tool state
+.claude/
+.headroom/
