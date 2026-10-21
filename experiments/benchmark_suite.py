@@ -4,6 +4,8 @@ Runs outside Mininet, entering the three existing client network namespaces
 using nsenter. Saves per-run JSON, run-level CSV and a summary CSV. Does not
 restart OVS or clear conntrack between experimental runs.
 """
+from __future__ import annotations
+
 import argparse
 from collections import Counter
 import csv
@@ -23,8 +25,9 @@ from controller.policy import meaningful_change
 from controller.config import BACKENDS, CLIENTS
 from controller.runtime import atomic_json as write_json, read_dict
 
-SCENARIOS = ('uniform', 'slow-b1', 'step-b1')
-# 100 ms extra service time triples b1's 50 ms service: one third capacity.
+SCENARIOS = ('uniform', 'step-b2')
+# 100 ms extra service time triples b2's 50 ms service: one third capacity
+# (80 -> 27 requests/s) while /health keeps passing, i.e. a gray failure.
 SLOW_DELAY_MS = 100
 
 
@@ -104,15 +107,14 @@ def profile(slow: set[str] = frozenset()) -> dict:
 def scenario_schedule(scenario: str, warmup: float, duration: float):
     """[(seconds after load starts, workload profile)], first entry at 0.
 
-    step-b1 slows b1 a third of the way into the measurement and restores it
-    at two thirds, so the timeline shows the controller adapting both ways.
+    uniform: the servers at their nominal sizes. step-b2 slows b2 a third of
+    the way into the measurement and restores it at two thirds: static
+    weights cannot follow, so the timeline shows adaptation both ways.
     """
     if scenario == 'uniform':
         return [(0, profile())]
-    if scenario == 'slow-b1':
-        return [(0, profile({'b1'}))]
-    if scenario == 'step-b1':
-        return [(0, profile()), (warmup + duration / 3, profile({'b1'})),
+    if scenario == 'step-b2':
+        return [(0, profile()), (warmup + duration / 3, profile({'b2'})),
                 (warmup + 2 * duration / 3, profile())]
     raise ValueError(scenario)
 
@@ -126,6 +128,14 @@ def record_timeline(runtime: Path, stop: threading.Event, samples: list):
                         'weights': status.get('installed_weights'),
                         'load': {n: (s or {}).get('load') for n, s in
                                  (status.get('backends') or {}).items()}})
+
+
+def peak_load(timeline: list) -> float | None:
+    """Highest load per worker any backend reached during the run; above 1
+    that backend was overloaded and building a queue."""
+    loads = [v for sample in timeline for v in (sample.get('load') or {}).values()
+             if isinstance(v, (int, float))]
+    return round(max(loads), 3) if loads else None
 
 
 def client_command(pid: int, rate: float, args):
@@ -196,7 +206,9 @@ def write_table(file: Path, rows: list[dict]):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--runtime', required=True, type=Path)
-    p.add_argument('--duration', type=float, default=15, help='measurement seconds')
+    # Long enough that the middle third of step-b2 outlasts the controller's
+    # convergence time (about 10-20 s).
+    p.add_argument('--duration', type=float, default=45, help='measurement seconds')
     p.add_argument('--warmup', type=float, default=6)
     p.add_argument('--settle', type=float, default=8)
     p.add_argument('--qps', type=float, default=150,
@@ -271,6 +283,7 @@ def main():
                            else None)
                 row = {'scenario': scenario, 'mode': mode, 'repeat': repeat,
                        'controller_cpu_pct_one_core': ctl_cpu,
+                       'peak_load': peak_load(timeline),
                        **{k: v for k, v in metrics.items() if k != 'errors'}}
                 rows.append(row)
                 artifact = {'summary': row, 'errors': metrics['errors'],
@@ -292,7 +305,8 @@ def main():
         for (scenario, mode), items in sorted(groupings.items()):
             aggregate = {'scenario': scenario, 'mode': mode, 'runs': len(items)}
             for key in ('throughput_rps', 'failure_rate_pct', 'p50_ms',
-                        'p95_ms', 'p99_ms', 'mean_ms', 'controller_cpu_pct_one_core'):
+                        'p95_ms', 'p99_ms', 'mean_ms', 'peak_load',
+                        'controller_cpu_pct_one_core'):
                 values = [r[key] for r in items if r[key] is not None]
                 aggregate[key] = round(statistics.mean(values), 3) if values else None
             aggregates.append(aggregate)
@@ -300,8 +314,9 @@ def main():
         print(f'\nRESULTS: {root}', flush=True)
         for a in aggregates:
             print(f'{a["scenario"]:>12} {a["mode"]:>8} '
-                  f'rps={a["throughput_rps"]} p95={a["p95_ms"]} '
-                  f'failure%={a["failure_rate_pct"]}', flush=True)
+                  f'p99={a["p99_ms"]} p95={a["p95_ms"]} '
+                  f'failure%={a["failure_rate_pct"]} peak_load={a["peak_load"]} '
+                  f'rps={a["throughput_rps"]}', flush=True)
     finally:
         # Dashboard actions must not interfere with an active benchmark.
         active = runtime / 'benchmark_active.json'

@@ -170,4 +170,9 @@ class Monitor:
                 'history': list(self.history),
                 'events': controller_events(runtime),
                 'traffic_job': active_job, 'benchmark_active': benchmark_active,
+                # Client-measured latency per second: this run and the one before.
+                'traffic_runs': [{'meta': read_dict(runtime / f'traffic_meta{suffix}.json'),
+                                  'points': read_dict(runtime / f'traffic_timeline{suffix}.json')
+                                  .get('points') or []}
+                                 for suffix in ('', '_prev')],
             }

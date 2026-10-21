@@ -15,13 +15,14 @@ def healthy(now, down=()):
 class FluidLab:
     """Closed-loop stand-in for the switch + backends.
 
-    Each backend serves `capacity` req/s with WORKERS workers; arrivals split
+    Each backend serves `capacity` req/s with `workers` workers; arrivals split
     by the installed weights; excess work queues. Publishes the same
     cumulative counters as backend/server.py.
     """
 
-    def __init__(self, capacity, offered):
+    def __init__(self, capacity, offered, workers=(WORKERS,) * 3):
         self.capacity = dict(zip(NAMES, capacity))
+        self.workers = dict(zip(NAMES, workers))
         self.offered = offered
         self.queue = {n: 0.0 for n in NAMES}
         self.counters = {n: {'arrived': 0.0, 'busy_s': 0.0, 'completed': 0.0}
@@ -37,11 +38,11 @@ class FluidLab:
             c = self.counters[n]
             c['arrived'] += arrivals * STEP
             c['completed'] += served * STEP
-            c['busy_s'] += served * STEP * WORKERS / self.capacity[n]
+            c['busy_s'] += served * STEP * self.workers[n] / self.capacity[n]
         self.now += STEP
 
     def metrics(self):
-        return {n: {'timestamp': self.now, 'workers': WORKERS, **self.counters[n]}
+        return {n: {'timestamp': self.now, 'workers': self.workers[n], **self.counters[n]}
                 for n in NAMES}
 
 
@@ -69,6 +70,37 @@ def test_converges_to_capacity_proportional_weights():
     assert lab.queue['b1'] == pytest.approx(0, abs=1)
     loads = [policy.states[n].load for n in NAMES]
     assert max(loads) / min(loads) < 1.25
+
+
+def test_learns_heterogeneous_server_sizes():
+    # The lab's servers: 2, 4, 6 workers at 50 ms = 40, 80, 120 req/s.
+    lab = FluidLab((40, 80, 120), offered=150, workers=(2, 4, 6))
+    policy = AdaptivePolicy(recovery_checks=1)
+    policy.reconcile_existing({n: 100 for n in NAMES})
+    weights = dict(policy.last_weights)
+    for _ in range(40):
+        lab.advance(weights)
+        weights = policy.evaluate(lab.metrics(), healthy(lab.now), now=lab.now)
+    for name, expected in zip(NAMES, (50, 100, 150)):
+        assert weights[name] == pytest.approx(expected, rel=0.12)
+
+
+def test_gray_failure_mid_run_and_recovery():
+    # b2 drops to a third of its capacity while healthy, then recovers.
+    lab = FluidLab((40, 80, 120), offered=150, workers=(2, 4, 6))
+    policy = AdaptivePolicy(recovery_checks=1)
+    policy.reconcile_existing({'b1': 50, 'b2': 100, 'b3': 150})
+    weights = dict(policy.last_weights)
+    for step in range(120):
+        if step == 40:
+            lab.capacity['b2'] = 80 / 3
+        if step == 80:
+            assert weights['b2'] == pytest.approx(300 * 80 / 3 / (40 + 80 / 3 + 120), rel=0.2)
+            assert lab.queue['b2'] == pytest.approx(0, abs=1)
+            lab.capacity['b2'] = 80
+        lab.advance(weights)
+        weights = policy.evaluate(lab.metrics(), healthy(lab.now), now=lab.now)
+    assert weights['b2'] == pytest.approx(100, rel=0.12)
 
 
 def test_settles_without_oscillation():

@@ -19,8 +19,9 @@ def test_equal_static_health_mask():
 
 
 def test_capacity_static():
+    # Proportional to the configured server sizes (2, 4, 6 workers).
     assert select_weights('capacity', {}, _states()) == {
-        'b1': 42, 'b2': 129, 'b3': 129}
+        'b1': 50, 'b2': 100, 'b3': 150}
 
 
 def test_adaptive_preserved():
@@ -39,11 +40,10 @@ def test_invalid_mode_fails_closed(tmp_path):
 def test_scenario_schedules():
     (start, uniform), = scenario_schedule('uniform', 6, 15)
     assert start == 0 and uniform['b1']['delay_ms'] == 0
-    (_, slow), = scenario_schedule('slow-b1', 6, 15)
-    assert slow['b1']['delay_ms'] == SLOW_DELAY_MS and slow['b3']['delay_ms'] == 0
-    step = scenario_schedule('step-b1', 6, 15)
-    assert [t for t, _ in step] == [0, 11, 16]
-    assert [p['b1']['delay_ms'] for _, p in step] == [0, SLOW_DELAY_MS, 0]
+    step = scenario_schedule('step-b2', 6, 45)
+    assert [t for t, _ in step] == [0, 21, 36]
+    assert [p['b2']['delay_ms'] for _, p in step] == [0, SLOW_DELAY_MS, 0]
+    assert all(p['b1']['delay_ms'] == p['b3']['delay_ms'] == 0 for _, p in step)
     with pytest.raises(ValueError):
         scenario_schedule('unknown', 6, 15)
 

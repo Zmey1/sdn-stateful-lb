@@ -1,7 +1,7 @@
 """Local-only monitoring API; opt-in bounded demo controls.
 
 Run from project root:
-    sudo .venv-dashboard/bin/python -m monitoring.server --runtime /tmp/sdn-lb-...
+    sudo "$CONDA_PREFIX/bin/python" -m monitoring.server --runtime /tmp/sdn-lb-...
 Add --allow-controls for dashboard control buttons. No shell command or path
 is accepted from HTTP clients, and the API never changes OpenFlow rules.
 """
@@ -21,9 +21,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from typing import Literal
 
 from controller.benchmark_modes import MODE_NAMES
 from controller.cli import restart_backend
+from experiments.benchmark_suite import SLOW_DELAY_MS, percentile
 from controller.runtime import (BACKEND_NAMES, atomic_json, pid_alive, read_dict,
                                 set_drain)
 from monitoring.core import Monitor, benchmark_data
@@ -52,8 +54,10 @@ class WorkloadRequest(BaseModel):
 
 
 class TrafficRequest(BaseModel):
-    rate: int = Field(ge=1, le=180)
-    duration: int = Field(ge=3, le=30)
+    rate: int = Field(ge=1, le=300)  # above ~240 req/s (all backends full) the lab saturates
+    duration: int = Field(ge=3, le=60)
+    # gray-b2: b2 is slowed (still healthy) for the middle third of the run.
+    scenario: Literal['steady', 'gray-b2'] = 'steady'
 
 
 def create_app(runtime: Path, *, allow_controls=False,
@@ -166,8 +170,34 @@ def create_app(runtime: Path, *, allow_controls=False,
             atomic_json(runtime / 'benchmark_mode.json', {'mode': 'adaptive'})
         return {'ok': True, 'note': 'Requested adaptive mode; reset delays and drains'}
 
-    def launch_traffic(rate, duration):
+    def set_delay(backend, delay_ms):
+        with control_lock:
+            current = read_dict(runtime / 'workload_profile.json')
+            current[backend] = {'delay_ms': delay_ms}
+            atomic_json(runtime / 'workload_profile.json', current)
+
+    def launch_traffic(rate, duration, scenario):
+        timers, restore = [], None
+        timeline = runtime / 'traffic_timeline.json'
         try:
+            # Keep the previous run's timeline so the chart can compare two
+            # policies on the same scenario.
+            for name in ('traffic_timeline', 'traffic_meta'):
+                if (runtime / f'{name}.json').exists():
+                    os.replace(runtime / f'{name}.json', runtime / f'{name}_prev.json')
+            status = read_dict(runtime / 'status.json')
+            meta = {'mode': status.get('benchmark_mode', 'unknown'), 'rate': rate,
+                    'duration': duration, 'scenario': scenario, 'slow_window': None}
+            if scenario == 'gray-b2':
+                before = int((read_dict(runtime / 'workload_profile.json').get('b2') or {})
+                             .get('delay_ms', 0))
+                meta['slow_window'] = [duration / 3, 2 * duration / 3]
+                restore = threading.Timer(2 * duration / 3, set_delay, ('b2', before))
+                timers = [threading.Timer(duration / 3, set_delay, ('b2', SLOW_DELAY_MS)),
+                          restore]
+            atomic_json(runtime / 'traffic_meta.json', meta)
+            for timer in timers:
+                timer.start()
             pids = read_dict(runtime / 'host_pids.json')
             pid = int(pids['h1'])
             if not pid_alive(pid):
@@ -175,7 +205,8 @@ def create_app(runtime: Path, *, allow_controls=False,
             command = ['nsenter', '-t', str(pid), '-n', '--', sys.executable,
                        '-m', 'experiments.load_client', '--rate', str(rate),
                        '--duration', str(duration), '--warmup', '0',
-                       '--timeout', '3', '--max-inflight', '60']
+                       '--timeout', '3', '--max-inflight', '60',
+                       '--timeline', str(timeline)]
             result = subprocess.run(command, cwd=ROOT, capture_output=True,
                                     text=True, timeout=duration + 30)
             if result.returncode:
@@ -185,12 +216,22 @@ def create_app(runtime: Path, *, allow_controls=False,
                 'state': 'completed', 'timestamp': time.time(),
                 'rate': rate, 'duration': duration, 'offered': report.get('offered'),
                 'success': report.get('success'), 'backends': report.get('backends'),
-                'errors': report.get('errors'),
+                'errors': report.get('errors'), 'scenario': scenario,
+                'mode': meta['mode'],
+                'p95_ms': percentile(report.get('latencies_ms') or [], 95),
+                'p99_ms': percentile(report.get('latencies_ms') or [], 99),
             })
         except (OSError, ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired) as exc:
             atomic_json(runtime / 'dashboard_traffic.json',
                         {'state': 'failed', 'timestamp': time.time(), 'error': str(exc)[:250]})
         finally:
+            # Timer.finished is set once the timer has run, or by cancel().
+            restored = restore is None or restore.finished.is_set()
+            for timer in timers:
+                timer.cancel()
+            if not restored:
+                # The run ended early: never leave b2 slowed behind.
+                restore.function(*restore.args)
             traffic_lock.release()
 
     @app.post('/api/control/traffic')
@@ -200,9 +241,10 @@ def create_app(runtime: Path, *, allow_controls=False,
             raise HTTPException(409, 'A dashboard traffic test is already running')
         atomic_json(runtime / 'dashboard_traffic.json', {
             'state': 'running', 'timestamp': time.time(),
-            'rate': body.rate, 'duration': body.duration,
+            'rate': body.rate, 'duration': body.duration, 'scenario': body.scenario,
         })
-        threading.Thread(target=launch_traffic, args=(body.rate, body.duration),
+        threading.Thread(target=launch_traffic,
+                         args=(body.rate, body.duration, body.scenario),
                          daemon=True).start()
         return {'ok': True, 'message': 'Generating requests from h1 inside Mininet'}
 

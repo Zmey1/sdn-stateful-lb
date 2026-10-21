@@ -8,7 +8,6 @@ continuously measures how loaded each backend is and rewrites the group
 weights so that every backend runs at the same load per worker, i.e. each one
 receives traffic in proportion to its capacity.
 
-> Research lab, not a production HA appliance. Validate on Ubuntu with Mininet.
 
 ## Architecture
 
@@ -25,7 +24,7 @@ receives traffic in proportion to its capacity.
    +-------------------------------^----------------------------------+
         |        |        |        | OpenFlow 1.3 (127.0.0.1:6653)
        b1       b2       b3        |  PortDesc, GroupDesc, GroupStats, GroupMod
-  (4 workers x 50 ms each)   Ryu controller (controller/lb_app.py)
+  (2 / 4 / 6 workers x 50 ms)  Ryu controller (controller/lb_app.py)
         \_______ telemetry, probe results, drains: /tmp/sdn-lb-*/ files
 ```
 
@@ -34,10 +33,12 @@ their backend through conntrack (verified by the self-test below).
 
 ## How the dynamic balancing works
 
-**Capacity.** Each backend has 4 workers and needs 50 ms per request
-(80 req/s). Extra requests queue, so an overloaded server gets slow, as a real
-one would. Injecting a 100 ms delay on b1 keeps its workers busy 3x longer: b1
-drops to one third of the capacity of b2/b3.
+**Capacity.** b1, b2, b3 are a small, medium and large server: 2, 4 and 6
+workers at 50 ms per request, i.e. 40, 80 and 120 req/s (240 in total,
+`controller/config.py`). Extra requests queue, so an overloaded server gets
+slow, as a real one would. Injecting a 100 ms delay on a backend keeps its
+workers busy 3x longer, cutting it to a third of its capacity while `/health`
+still passes (a gray failure).
 
 **Measurement.** Backends publish cumulative counters (`arrived`, `busy_s`,
 `completed`). Every 2 s the controller differences them into the **offered
@@ -72,15 +73,14 @@ average share over 30 s, then `HEALTHY`. Manual drain sets weight 0 without
 touching existing connections.
 
 **Evidence.** `tests/test_policy.py` closes the loop around a simulated
-cluster: with b1 at one third capacity and 62 % offered load, the weights
-converge to the capacity ratio (≈ 43 : 128 : 128) in about 8 s and stay there.
-Against the real backend servers the same controller converged in about 20 s to
-≈ 52 : 121 : 127, with all three backends near 80 % load per worker.
+cluster of the lab's servers at 150 req/s: from 100 : 100 : 100 the weights
+reach the size ratio (≈ 50 : 100 : 150) in about 8 s. When b2 drops to a third
+of its capacity mid-run they move to ≈ 66 : 40 : 194 within about 8 s and b2's
+queue drains, and they return once b2 recovers. The simulation omits the 5 s
+minimum between switch updates, so in the real lab expect roughly 10–20 s.
 
 ## Requirements
 
-- Ubuntu 22.04 or newer (Mininet and Open vSwitch need Linux and `sudo`);
-  on a Mac, run it in an Ubuntu VM — see [macOS](#macos-apple-silicon-or-intel)
 - Conda (Anaconda or Miniconda)
 - Python 3.9 in a Conda env named `sdn-ryu` (Ryu 4.34 does not support newer Pythons)
 
@@ -91,7 +91,7 @@ git clone https://github.com/Zmey1/sdn-stateful-lb.git && cd sdn-stateful-lb
 conda create -n sdn-ryu python=3.9 -y
 conda activate sdn-ryu
 sudo -E bash scripts/setup_ubuntu.sh   # apt packages, Mininet into the env, requirements
-python -m pytest                        # 55 tests, no root needed
+python -m pytest                        # 57 tests, no root needed
 ```
 
 `setup_ubuntu.sh` installs Mininet and Open vSwitch with apt, copies Mininet's
@@ -139,75 +139,37 @@ group MOD`.
 sudo "$CONDA_PREFIX/bin/python" -m topology.lab --self-test
 ```
 
-## macOS (Apple Silicon or Intel)
-
-Mininet needs Linux kernel features (network namespaces, the Open vSwitch
-datapath, conntrack), so on a Mac the lab runs inside an Ubuntu VM.
-[Multipass](https://multipass.run) works on both Apple Silicon and Intel.
-
-**1. Create the VM** (Mac terminal):
-
-```bash
-brew install --cask multipass
-multipass launch 22.04 --name sdn --cpus 4 --memory 4G --disk 20G
-multipass shell sdn
-```
-
-**2. Inside the VM**, install Miniconda (the `uname -m` picks the ARM or
-Intel build), then follow [Setup](#setup-once) and [Run](#run) unchanged:
-
-```bash
-curl -fsSLO "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-$(uname -m).sh"
-bash "Miniconda3-latest-Linux-$(uname -m).sh" -b && ~/miniconda3/bin/conda init bash
-exec bash
-sudo apt-get update && sudo apt-get install -y gh && gh auth login   # the repo is private
-git clone https://github.com/Zmey1/sdn-stateful-lb.git && cd sdn-stateful-lb
-conda create -n sdn-ryu python=3.9 -y && conda activate sdn-ryu
-sudo -E bash scripts/setup_ubuntu.sh
-./start_dev.sh
-```
-
-**3. Open the dashboard on the Mac.** It listens only on the VM's
-`127.0.0.1` (its controls change the lab), so tunnel to it over SSH. Once,
-add your Mac's SSH key to the VM (use your `.pub` file; create one with
-`ssh-keygen` if you have none):
-
-```bash
-multipass exec sdn -- bash -c "echo '$(cat ~/.ssh/id_ed25519.pub)' >> ~/.ssh/authorized_keys"
-```
-
-Then, while `./start_dev.sh` runs in the VM:
-
-```bash
-ssh -N -L 8765:127.0.0.1:8765 ubuntu@"$(multipass info sdn | awk '/IPv4/{print $2}')"
-```
-
-and open http://127.0.0.1:8765 on the Mac. Stop the VM with
-`multipass stop sdn`; `multipass start sdn` and `multipass shell sdn` resume it.
-
 ## Presentation demo (about 5 minutes)
 
-All from the dashboard's "Try the load balancer" panel.
+All from the dashboard's guided panel; watch the **latency chart** (p95 per
+second, measured by the client) and the weights.
 
-1. **Baseline** — *Run baseline traffic* (150 req/s; the cluster serves 240).
-   The three backends sit at similar load per worker; the switch-observed
-   connection shares track the weights 100/100/100.
-2. **Degrade b1** — *Add 100 ms to b1*. b1 still answers `/health`, so it
-   stays HEALTHY: this is a capacity problem, not a failure.
-3. **Adapt** — *Run degraded traffic* (150 req/s, 30 s). b1's load per worker
-   climbs past 100 %, then its weight drops to about 45–55 while b2/b3 rise,
-   until all three loads are equal again.
-4. **Contrast** — *Advanced controls → EQUAL*, run traffic again: b1 is
-   overloaded at a third of the traffic and its response time explodes. Switch
-   back to *ADAPTIVE*.
-5. **Failure** — *Crash* b1: 3 probe failures later it is DOWN with weight 0;
-   traffic continues on b2/b3. *Restart*: DOWN → RECOVERING (small weight,
-   ramping) → HEALTHY.
+1. **Learn the sizes** — *Run steady traffic* (150 req/s, 20 s). Nobody tells
+   the controller the server sizes; the weights move from 100 : 100 : 100 to
+   about 50 : 100 : 150.
+2. **Gray failure, adaptive** — *Run with ADAPTIVE* (45 s). From 15 s to 30 s
+   b2 is 100 ms slower but still HEALTHY. p95 rises, then falls as the
+   controller moves traffic off b2; weights return when b2 recovers.
+3. **Same failure, static weights** — *Run with STATIC weights*: fixed
+   50 : 100 : 150, what an operator would configure from the sizes. b2 stays
+   overloaded until it recovers; the chart overlays this run on the previous
+   one (dashed).
+4. **Failure** — *Crash* b2: 3 probe failures later it is DOWN with weight 0.
+   *Restart*: DOWN → RECOVERING (ramping) → HEALTHY.
+5. **Overload** — custom traffic at 280 req/s: above the 240 req/s total no
+   policy helps. The balancer spreads load; it cannot create capacity.
 6. **Reset the lab.**
 
-Talking points: the controller never sees a data packet; weights change only
-new-connection selection; the switch is the source of truth (installed weights
-are read back after every GroupMod).
+**Compared with production load balancers.** The control law is the one used
+by gRPC's `weighted_round_robin` with backend-reported utilization (ORCA):
+weight ∝ request rate / utilization, i.e. equal load per worker. Reweighting a
+server that is slow but still healthy is what AWS ALB's automatic target
+weights do; the recovery ramp and drain mirror HAProxy/Envoy slow start and
+connection draining. Least-connections, the usual per-request alternative,
+does not fit here: an OVS SELECT group cannot count connections, and sending
+every new connection to the controller (Packet-In) would not scale. Limits:
+one switch, emulated capacity (worker slots, not real CPU), a 2 s control loop
+rather than per-request decisions.
 
 ## Experiments
 
@@ -215,10 +177,11 @@ are read back after every GroupMod).
 # Failure + recovery: crash b1, verify exclusion and gradual re-entry.
 sudo "$PY" -m experiments.recovery_check --runtime "$RUNTIME" --backend b1
 
-# Benchmark: adaptive vs equal vs capacity (hand-computed oracle 42:129:129)
-# for scenarios uniform, slow-b1 and step-b1 (b1 slows mid-run, then recovers).
-# Saves per-run JSON (with a weight/load timeline), runs.csv and summary.csv
-# under $RUNTIME/bench_results/; the dashboard shows the newest summary.
+# Benchmark: adaptive vs equal vs capacity (static 50:100:150 from the sizes)
+# for scenarios uniform and step-b2 (b2 slowed for the middle third of a 45 s
+# run). Reports p99, p95, failures and peak load per worker; saves per-run JSON
+# (with a weight/load timeline), runs.csv and summary.csv under
+# $RUNTIME/bench_results/; the dashboard shows the newest summary.
 sudo "$PY" -m experiments.benchmark_suite --runtime "$RUNTIME" --repeats 3
 
 # Session persistence across weight changes. Starts its own lab, so first exit
@@ -232,65 +195,3 @@ the last weights (fail-mode secure). Restart with
 `sudo "$PY" -m controller.lb_app --runtime "$RUNTIME"`: on reconnect Ryu reads
 the existing group, adopts its weights and saved health state, and sends no
 flow or group changes, so conntrack sessions are untouched.
-
-## Parameters
-
-| Property | Value |
-|---|---|
-| Backend capacity | 4 workers × 50 ms = 80 req/s (`controller/config.py`) |
-| Probe interval / timeout / freshness | 2 s / 0.75 s / 5 s |
-| DOWN after / recovery after | 3 failed / 3 successful checks |
-| Recovery ramp | 30 s, 10 % → 100 % of average share |
-| Control cycle / minimum update interval | 2 s / 5 s (membership changes immediate) |
-| Gain / max step / deadband / idle / floor | 0.5 / ×1.5 / 10 % / ρ̄ < 0.05 / 3 % share |
-| Total weight, group, conntrack zone | 300, SELECT 100, zone 10 |
-
-## Dashboard
-
-FastAPI on 127.0.0.1 only, serving an offline React page. Controls
-(`--allow-controls`, on by default from `start_dev.sh`) are bounded: policy
-mode, drain, injected delay (≤ 350 ms), crash/restart of a verified backend
-worker, a 3–30 s traffic test from h1, and reset. Requests from other origins
-are rejected, and controls lock while a benchmark runs.
-
-## Troubleshooting
-
-- `OVS bridge s1 already exists` — exit the old lab; if it crashed, `sudo mn -c`.
-- `Another lab is running` — exit the other lab first; if it crashed, `sudo mn -c`.
-- `Dashboard port unavailable` — a dashboard is still running; stop it or pass `--port 8766`.
-- Controller offline or CONTROLLER ERROR — read `sudo tail -80 "$RUNTIME/controller.log"`;
-  a failing control step is logged there with its traceback.
-- `sdn-ryu Python cannot import Mininet` — rerun `sudo -E bash scripts/setup_ubuntu.sh`.
-- 0 req/s — expected until you generate traffic; probes are not counted.
-- No benchmark table — run the suite or pass `--bench-root` to `start_dev.sh`.
-
-## Limitations
-
-- Probes check direct backend reachability from `p1`, not each client→VIP path.
-- Runtime files are a lab-only telemetry transport; production needs an
-  authenticated management network.
-- One switch, IPv4 TCP 8080. No conntrack replication: an OVS restart or a
-  backend crash can break established sessions.
-- With very few connections, SELECT hashing does not give exact ratios.
-
-## Source map
-
-| Path | Role |
-|---|---|
-| `controller/lb_app.py` | Ryu app: switch connect, reconciliation, control loop |
-| `controller/openflow.py` | Flow and group messages (conntrack/NAT pipeline) |
-| `controller/policy_loop.py` | One control cycle: files → policy → weights → status |
-| `controller/policy.py` | Health state machine and load-equalizing control law |
-| `controller/health_probe.py` | Independent HTTP probes from `p1` |
-| `controller/benchmark_modes.py` | adaptive / equal / capacity modes |
-| `controller/runtime.py` | Atomic runtime JSON files, process checks, drains |
-| `controller/cli.py`, `ofctl.py` | Operator commands; read-only OVS inspection |
-| `backend/server.py` | Finite-capacity HTTP backend + telemetry |
-| `topology/lab.py` | Mininet topology, process lifecycle, self-test |
-| `monitoring/` | Dashboard API and static UI |
-| `experiments/` | Load generator, benchmark suite, recovery and session checks |
-| `tests/` | Unit, simulation and OpenFlow-encoding tests |
-
-References: [OVS conntrack tutorial](https://docs.openvswitch.org/en/stable/tutorials/ovs-conntrack/),
-[OVS actions](https://docs.openvswitch.org/en/stable/ref/ovs-actions.7/),
-[Ryu](https://ryu.readthedocs.io/).

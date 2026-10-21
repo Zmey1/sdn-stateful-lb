@@ -6,12 +6,15 @@ selected just to make a benchmark look worse.
 """
 import json
 from pathlib import Path
-from .config import BACKENDS
+from .config import BACKENDS, BACKEND_WORKERS
+from .policy import TOTAL_WEIGHT
 
 MODE_NAMES = ('adaptive', 'equal', 'capacity')
-# Oracle for the slow-b1 scenario: weights proportional to the true capacities
-# (b1 has one third of b2/b3). The adaptive policy must learn this unaided.
-STATIC_CAPACITY = {'b1': 42, 'b2': 129, 'b3': 129}
+# The static weights an operator would configure from the server sizes:
+# proportional to nominal capacity (50:100:150). They are right until a
+# server's real capacity changes at runtime, which they cannot follow.
+STATIC_CAPACITY = {b.name: round(TOTAL_WEIGHT * BACKEND_WORKERS[b.name]
+                                 / sum(BACKEND_WORKERS.values())) for b in BACKENDS}
 
 
 def read_mode(runtime: Path) -> str:

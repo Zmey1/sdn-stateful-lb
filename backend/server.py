@@ -153,9 +153,12 @@ def main():
     p.add_argument('--name', required=True)
     p.add_argument('--port', type=int, default=VPORT)
     p.add_argument('--runtime', type=Path, required=True)
-    p.add_argument('--workers', type=int, default=BACKEND_WORKERS)
+    p.add_argument('--workers', type=int,
+                   help='default: this backend\'s size in controller/config.py')
     p.add_argument('--service-ms', type=int, default=BACKEND_SERVICE_MS)
     a = p.parse_args()
+    if a.workers is None:
+        a.workers = BACKEND_WORKERS.get(a.name, 4)
     if a.workers < 1 or a.service_ms < 0:
         p.error('workers must be >= 1 and service-ms >= 0')
     stats = Stats(a.name, a.workers)
