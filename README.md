@@ -79,7 +79,8 @@ Against the real backend servers the same controller converged in about 20 s to
 
 ## Requirements
 
-- Ubuntu 22.04 or newer (Mininet and Open vSwitch need Linux and `sudo`)
+- Ubuntu 22.04 or newer (Mininet and Open vSwitch need Linux and `sudo`);
+  on a Mac, run it in an Ubuntu VM — see [macOS](#macos-apple-silicon-or-intel)
 - Conda (Anaconda or Miniconda)
 - Python 3.9 in a Conda env named `sdn-ryu` (Ryu 4.34 does not support newer Pythons)
 
@@ -137,6 +138,52 @@ group MOD`.
 ```bash
 sudo "$CONDA_PREFIX/bin/python" -m topology.lab --self-test
 ```
+
+## macOS (Apple Silicon or Intel)
+
+Mininet needs Linux kernel features (network namespaces, the Open vSwitch
+datapath, conntrack), so on a Mac the lab runs inside an Ubuntu VM.
+[Multipass](https://multipass.run) works on both Apple Silicon and Intel.
+
+**1. Create the VM** (Mac terminal):
+
+```bash
+brew install --cask multipass
+multipass launch 22.04 --name sdn --cpus 4 --memory 4G --disk 20G
+multipass shell sdn
+```
+
+**2. Inside the VM**, install Miniconda (the `uname -m` picks the ARM or
+Intel build), then follow [Setup](#setup-once) and [Run](#run) unchanged:
+
+```bash
+curl -fsSLO "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-$(uname -m).sh"
+bash "Miniconda3-latest-Linux-$(uname -m).sh" -b && ~/miniconda3/bin/conda init bash
+exec bash
+sudo apt-get update && sudo apt-get install -y gh && gh auth login   # the repo is private
+git clone https://github.com/Zmey1/sdn-stateful-lb.git && cd sdn-stateful-lb
+conda create -n sdn-ryu python=3.9 -y && conda activate sdn-ryu
+sudo -E bash scripts/setup_ubuntu.sh
+./start_dev.sh
+```
+
+**3. Open the dashboard on the Mac.** It listens only on the VM's
+`127.0.0.1` (its controls change the lab), so tunnel to it over SSH. Once,
+add your Mac's SSH key to the VM (use your `.pub` file; create one with
+`ssh-keygen` if you have none):
+
+```bash
+multipass exec sdn -- bash -c "echo '$(cat ~/.ssh/id_ed25519.pub)' >> ~/.ssh/authorized_keys"
+```
+
+Then, while `./start_dev.sh` runs in the VM:
+
+```bash
+ssh -N -L 8765:127.0.0.1:8765 ubuntu@"$(multipass info sdn | awk '/IPv4/{print $2}')"
+```
+
+and open http://127.0.0.1:8765 on the Mac. Stop the VM with
+`multipass stop sdn`; `multipass start sdn` and `multipass shell sdn` resume it.
 
 ## Presentation demo (about 5 minutes)
 
