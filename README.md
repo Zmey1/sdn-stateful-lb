@@ -1,187 +1,217 @@
-> **Milestone 4 added:** See [MILESTONE4.md](MILESTONE4.md) for the automated benchmark suite and smoke-test commands.
+# Stateful dynamic SDN load balancer (Ryu + Open vSwitch + Mininet)
 
-# Stateful adaptive SDN load balancer: Milestone 3
+Clients reach one virtual IP (`10.0.3.100:8080`). Open vSwitch picks a backend
+for each **new** TCP connection from a weighted OpenFlow SELECT group, pins the
+connection with conntrack NAT, and forwards everything in the data plane — no
+packet ever goes to the controller. A **Ryu** OpenFlow 1.3 controller
+continuously measures how loaded each backend is and rewrites the group
+weights so that every backend runs at the same load per worker, i.e. each one
+receives traffic in proportion to its capacity.
 
-This is **data-plane load balancing** with Open vSwitch/OpenFlow, not per-connection Python Packet-In forwarding. Existing connections are pinned using OVS conntrack DNAT (`ct_mark=1`), and new TCP connections enter a weighted SELECT group.
+> Research lab, not a production HA appliance. Validate on Ubuntu with Mininet.
 
-**New in Milestone 3:** independent active HTTP probes, automatic DOWN/RECOVERING/HEALTHY transitions, gradual recovery weight ramp, manual drain, restart reconciliation without deleting flows or conntrack mappings, duplicate-controller protection, and an end-to-end failure/recovery experiment.
+## Architecture
 
-> This is a Mininet research lab, **not a production-ready HA appliance**. Controller restart does not reset installed forwarding rules, but an OVS switch crash can still lose connections. We could run pure-Python tests in the code-generation environment, not a live Mininet datapath. Validate on Ubuntu.
-
-## 1. Setup
-
-Requirements: Ubuntu, root access, `mininet`, `openvswitch-switch`, `ovs-ofctl`, `mnexec`, and Python 3.10+.
-
-```bash
-sudo bash scripts/setup_ubuntu.sh
-python3 -m pytest tests -q
+```
+ h1 h2 h3 (clients)                    p1 (health probe, own namespace)
+      \  |  /                              |  GET /health to each backend IP
+       \ | /  TCP to VIP 10.0.3.100:8080   |
+   +------------------- OVS s1 (fail-mode secure) --------------------+
+   | table 0  classify: client->VIP, backend replies, probe bypass    |
+   | table 10 conntrack: committed (ct_mark=1) -> table 30            |
+   |          new SYN -> group 100 (SELECT, weighted buckets)         |
+   |            bucket: ct(commit, nat(dst=backend), ct_mark=1)       |
+   | table 30 route: dec_ttl, rewrite MACs, output                    |
+   +-------------------------------^----------------------------------+
+        |        |        |        | OpenFlow 1.3 (127.0.0.1:6653)
+       b1       b2       b3        |  PortDesc, GroupDesc, GroupStats, GroupMod
+  (4 workers x 50 ms each)   Ryu controller (controller/lb_app.py)
+        \_______ telemetry, probe results, drains: /tmp/sdn-lb-*/ files
 ```
 
-Important: **exit your previous Mininet lab before starting this one**. This version adds a seventh host, `p1`, and rewrites the OVS pipeline. Do not copy new source files into an already-running milestone-1 switch and expect the new health paths to appear.
+Changing group weights only affects **new** connections; established ones keep
+their backend through conntrack (verified by the self-test below).
 
-## 2. Start the new adaptive lab (terminal A)
+## How the dynamic balancing works
 
-```bash
-sudo python3 -m topology.lab --adaptive
+**Capacity.** Each backend has 4 workers and needs 50 ms per request
+(80 req/s). Extra requests queue, so an overloaded server gets slow, as a real
+one would. Injecting a 100 ms delay on b1 keeps its workers busy 3x longer: b1
+drops to one third of the capacity of b2/b3.
+
+**Measurement.** Backends publish cumulative counters (`arrived`, `busy_s`,
+`completed`). Every 2 s the controller differences them into the **offered
+load per worker**
+
+```
+rho_i = arrival_rate_i * mean_service_time_i / workers_i
 ```
 
-The lab prints a runtime path similar to `/tmp/sdn-lb-abcdef12`. Use the **new** runtime path in all commands below; it is not the same as the previous lab's path.
+which equals utilization below saturation and exceeds 1 when requests arrive
+faster than the server can serve them. Unlike queue length or latency it has no
+memory of past overload, which keeps the control loop from oscillating.
 
-The topology includes:
+**Control law.** Starting from the weights *actually installed in the switch*:
 
-- `h1/h2/h3`, client IPs `10.0.1.11-13`.
-- `b1/b2/b3`, backend IPs `10.0.2.11-13`.
-- `p1`, independent health probe IP `10.0.1.50`.
-- VIP `10.0.3.100:8080`.
-- OVS bridge `s1`, with default-drop OpenFlow table rules.
-
-The `p1` probe sends direct `GET /health` requests to each server IP, using explicit high-priority OpenFlow forwarding in both directions. It **does not** send checks via the VIP or SELECT group, and it runs as a process separate from the policy controller. The controller reads the probe results and separately reads backend telemetry for capacity estimation.
-
-Inside Mininet:
-
-```text
-mininet> h1 curl -s http://10.0.3.100:8080/work
-mininet> p1 curl -s http://10.0.2.11:8080/health
+```
+rho_bar = traffic-weighted mean of rho over healthy backends
+share_i <- share_i * clamp((rho_bar / rho_i) ** 0.5, 1/1.5, 1.5)
 ```
 
-## 3. Watch state (terminal B)
+Busier-than-average backends lose share, quieter ones gain it, until all run
+at the same load. At that point traffic is proportional to capacity — without
+the capacity ever being configured. Safeguards: a 10 % deadband, no changes
+when the cluster is idle (no signal), a 3 % minimum share so every healthy
+backend keeps being measured, and switch updates at most every 5 s unless a
+backend joins or leaves (then immediately).
 
-From the project root:
+**Health.** Independent of load, the `p1` probe checks `/health` on each
+backend directly every 2 s. Three failures mark a backend `DOWN` (weight 0);
+three successes start `RECOVERING`, which ramps from 10 % to 100 % of an
+average share over 30 s, then `HEALTHY`. Manual drain sets weight 0 without
+touching existing connections.
+
+**Evidence.** `tests/test_policy.py` closes the loop around a simulated
+cluster: with b1 at one third capacity and 62 % offered load, the weights
+converge to the capacity ratio (≈ 43 : 128 : 128) in about 8 s and stay there.
+Against the real backend servers the same controller converged in about 20 s to
+≈ 52 : 121 : 127, with all three backends near 80 % load per worker.
+
+## Setup (once)
 
 ```bash
-RUNTIME=/tmp/sdn-lb-REPLACE_WITH_NEW_VALUE
-sudo python3 -m controller.cli health --runtime "$RUNTIME"
-sudo python3 -m controller.cli status --runtime "$RUNTIME"
-sudo python3 -m controller.cli show
+conda activate sdn-ryu
+sudo -E bash scripts/setup_ubuntu.sh   # apt packages, Mininet into the env, requirements
+python -m pytest                        # 55 tests, no root needed
+```
+
+Every component (Mininet lab, Ryu, probe, dashboard, experiments) runs on the
+`sdn-ryu` interpreter.
+
+## Run
+
+```bash
+conda activate sdn-ryu
+./start_dev.sh            # Mininet + Ryu + probe + dashboard in one terminal
+```
+
+Open http://127.0.0.1:8765. Type `exit` at the `mininet>` prompt to stop
+everything. In another terminal:
+
+```bash
+RUNTIME="$(cat .dev/current_runtime)"
+PY="$CONDA_PREFIX/bin/python"
+sudo "$PY" -m controller.cli status --runtime "$RUNTIME"   # weights, loads, states
+sudo "$PY" -m controller.cli show                          # OVS groups/flows
 sudo tail -f "$RUNTIME/controller.log"
 ```
 
-Wait until all three backends are `HEALTHY`. Their states progress from `DOWN -> RECOVERING -> HEALTHY` with a 30-second recovery window.
+Options: `./start_dev.sh --read-only`, `--port 8766`, `--bench-root DIR`.
+Without the dashboard: `sudo "$PY" -m topology.lab`.
 
-Live group counters:
+## Presentation demo (about 5 minutes)
 
-```bash
-sudo ovs-ofctl -O OpenFlow13 dump-group-stats s1
-sudo ovs-appctl dpctl/dump-conntrack zone=10
-```
+All from the dashboard's "Try the load balancer" panel.
 
-You may use `sh ovs-ofctl ...` inside Mininet; do not type `sudo ovs-ofctl ...` there, because Mininet treats that as its own CLI command.
+1. **Baseline** — *Run baseline traffic* (150 req/s; the cluster serves 240).
+   The three backends sit at similar load per worker; the switch-observed
+   connection shares track the weights 100/100/100.
+2. **Degrade b1** — *Add 100 ms to b1*. b1 still answers `/health`, so it
+   stays HEALTHY: this is a capacity problem, not a failure.
+3. **Adapt** — *Run degraded traffic* (150 req/s, 30 s). b1's load per worker
+   climbs past 100 %, then its weight drops to about 45–55 while b2/b3 rise,
+   until all three loads are equal again.
+4. **Contrast** — *Advanced controls → EQUAL*, run traffic again: b1 is
+   overloaded at a third of the traffic and its response time explodes. Switch
+   back to *ADAPTIVE*.
+5. **Failure** — *Crash* b1: 3 probe failures later it is DOWN with weight 0;
+   traffic continues on b2/b3. *Restart*: DOWN → RECOVERING (small weight,
+   ramping) → HEALTHY.
+6. **Reset the lab.**
 
-## 4. Run automated backend failure and recovery test (terminal B)
+Talking points: the controller never sees a data packet; weights change only
+new-connection selection; the switch is the source of truth (installed weights
+are read back after every GroupMod).
 
-**While adaptive Mininet is running**, and from the project root:
-
-```bash
-sudo python3 -m experiments.recovery_check --runtime "$RUNTIME" --backend b1 --requests 20
-```
-
-The test:
-
-1. Waits until `b1` is `HEALTHY`.
-2. Sends SIGTERM to the lab's `b1` HTTP worker.
-3. Waits for the controller to mark `b1` as `DOWN` and remove its SELECT bucket.
-4. Opens 20 **new TCP connections** through the VIP and verifies that none go to `b1`.
-5. Restarts the backend **inside its original Mininet namespace** using `mnexec -a`, without touching OVS conntrack state.
-6. Waits for `RECOVERING`, confirms a small positive weight, then waits for `HEALTHY` and a higher weight.
-
-The experiment intentionally kills one backend. Run only in this throwaway lab, not against production workloads.
-
-Alternatively, drain and restore a backend without killing it:
+## Experiments
 
 ```bash
-sudo python3 -m controller.cli drain b1 --runtime "$RUNTIME"
-sudo python3 -m controller.cli undrain b1 --runtime "$RUNTIME"
+# Failure + recovery: crash b1, verify exclusion and gradual re-entry.
+sudo "$PY" -m experiments.recovery_check --runtime "$RUNTIME" --backend b1
+
+# Benchmark: adaptive vs equal vs capacity (hand-computed oracle 42:129:129)
+# for scenarios uniform, slow-b1 and step-b1 (b1 slows mid-run, then recovers).
+# Saves per-run JSON (with a weight/load timeline), runs.csv and summary.csv
+# under $RUNTIME/bench_results/; the dashboard shows the newest summary.
+sudo "$PY" -m experiments.benchmark_suite --runtime "$RUNTIME" --repeats 3
+
+# Session persistence across weight changes (fresh lab, exits when done).
+sudo "$PY" -m topology.lab --self-test --connections 30
 ```
 
-Manual worker restart in the Mininet namespace (only when the old worker is stopped):
+**Controller restart without disruption:**
+`sudo kill -TERM "$(cat "$RUNTIME/controller.pid")"`. OVS keeps forwarding with
+the last weights (fail-mode secure). Restart with
+`sudo "$PY" -m controller.lb_app --runtime "$RUNTIME"`: on reconnect Ryu reads
+the existing group, adopts its weights and saved health state, and sends no
+flow or group changes, so conntrack sessions are untouched.
 
-```bash
-sudo python3 -m controller.cli restart-backend b1 --runtime "$RUNTIME"
-```
-
-## 5. Verify controller-only restart reconciliation
-
-While Mininet is still open, from terminal B:
-
-```bash
-sudo python3 -m controller.cli show > /tmp/sdn-before-controller-restart.txt
-sudo kill -TERM "$(cat "$RUNTIME/controller.pid")"
-```
-
-The OVS switch continues forwarding using the last installed policy. Existing TCP connections should remain unaffected by **controller-only** termination.
-
-From terminal B, restart the policy controller (the terminal stays occupied until Ctrl+C):
-
-```bash
-sudo python3 -u -m controller.policy_loop --runtime "$RUNTIME"
-```
-
-It will log a `reconciled installed weights=...` line and restore the saved policy state. It must **not** delete groups, flows, or conntrack entries.
-
-From terminal C:
-
-```bash
-sudo python3 -m controller.cli status --runtime "$RUNTIME"
-sudo ovs-ofctl -O OpenFlow13 dump-groups s1
-sudo ovs-appctl dpctl/dump-conntrack zone=10
-```
-
-To stop the lab, Ctrl+C the manually restarted controller, then type `exit` inside the Mininet prompt. The replacement backend workers tracked in `restarted_pids.json` are also terminated by the lab teardown.
-
-## 6. Retest the original session-persistence property
-
-Run on a **fresh** Mininet lab, not concurrently with `--adaptive`:
-
-```bash
-sudo python3 -m topology.lab --self-test --connections 30
-```
-
-Expected: all 30 sessions retain the original backend and TCP source port across group weight changes.
-
-## Default policy parameters
+## Parameters
 
 | Property | Value |
 |---|---|
-| Probe interval / timeout | 2.0s / 0.75s |
-| Probe freshness | 5.0s |
-| Consecutive failure evaluations to mark DOWN | 3 |
-| Consecutive successful evaluations before reentry | 3 |
-| Recovery ramp | 30 seconds (10% to 100% relative capacity factor) |
-| Control loop interval | 2 seconds |
-| Minimum ordinary group-update interval | 5 seconds |
-| Member removal / reentry | Immediate on policy decision, bypassing the update interval |
-| Group | SELECT ID 100 |
-| Conntrack zone | 10 |
+| Backend capacity | 4 workers × 50 ms = 80 req/s (`controller/config.py`) |
+| Probe interval / timeout / freshness | 2 s / 0.75 s / 5 s |
+| DOWN after / recovery after | 3 failed / 3 successful checks |
+| Recovery ramp | 30 s, 10 % → 100 % of average share |
+| Control cycle / minimum update interval | 2 s / 5 s (membership changes immediate) |
+| Gain / max step / deadband / idle / floor | 0.5 / ×1.5 / 10 % / ρ̄ < 0.05 / 3 % share |
+| Total weight, group, conntrack zone | 300, SELECT 100, zone 10 |
 
-Weights are normalized across the available servers to approximately 300. Thus a *relative* 10% recovering capacity may appear as more than 10 absolute group-weight units. The policy never promises deterministic ratios for a small number of TCP flows.
+## Dashboard
+
+FastAPI on 127.0.0.1 only, serving an offline React page. Controls
+(`--allow-controls`, on by default from `start_dev.sh`) are bounded: policy
+mode, drain, injected delay (≤ 350 ms), crash/restart of a verified backend
+worker, a 3–30 s traffic test from h1, and reset. Requests from other origins
+are rejected, and controls lock while a benchmark runs.
+
+## Troubleshooting
+
+- `OVS bridge s1 already exists` — exit the old lab; if it crashed, `sudo mn -c`.
+- Controller offline — check `$RUNTIME/controller.log` (port 6653 in use?
+  another controller holding `controller.lock`?).
+- `sdn-ryu Python cannot import Mininet` — rerun `sudo -E bash scripts/setup_ubuntu.sh`.
+- 0 req/s — expected until you generate traffic; probes are not counted.
+- No benchmark table — run the suite or pass `--bench-root` to `start_dev.sh`.
 
 ## Limitations
 
-- Active probes run from the dedicated Mininet probe namespace and check *direct* backend reachability. They do not validate each client-to-VIP route.
-- The probe and metrics use shared JSON files **only for the emulator**. Production needs an authenticated management network with agent identity and secure transport.
-- The 30-second recovery factor does not guarantee a monotonically increasing **absolute** group weight if other server loads change rapidly.
-- The controller reads prior installed weights and cached policy state on restart. It does **not** reinstate an OpenFlow group after total switch loss.
-- No conntrack replication between switches. Backend crashes can disrupt established sessions.
-- One OVS bridge, IPv4 TCP 8080 only. A production system needs ACLs, secure management, scaling and failure-domain review.
-- Counters may differ between OpenFlow and accelerated datapath; verify real traffic, logs, and conntrack rather than relying on a single counter.
+- Probes check direct backend reachability from `p1`, not each client→VIP path.
+- Runtime files are a lab-only telemetry transport; production needs an
+  authenticated management network.
+- One switch, IPv4 TCP 8080. No conntrack replication: an OVS restart or a
+  backend crash can break established sessions.
+- With very few connections, SELECT hashing does not give exact ratios.
 
 ## Source map
 
-- `topology/lab.py`: Mininet topology and lifecycle, including `p1` health-probe namespace.
-- `controller/pipeline.py`: VIP conntrack NAT pipeline and direct health-probe forwarding rules.
-- `controller/health_probe.py`: independent active HTTP checks.
-- `controller/policy.py`: probe-driven health states and gradual adaptive recovery.
-- `controller/policy_loop.py`: policy controller with OVS readback reconciliation and state persistence.
-- `controller/ofctl.py`: OpenFlow install/update/readback, including group parser.
-- `controller/cli.py`: show/status/health/drain/restart-backend tools.
-- `experiments/recovery_check.py`: live failure-recovery integration experiment.
-- `experiments/session_check.py`: unchanged connection-persistence experiment.
-- `tests/`: pure-Python tests.
+| Path | Role |
+|---|---|
+| `controller/lb_app.py` | Ryu app: switch connect, reconciliation, control loop |
+| `controller/openflow.py` | Flow and group messages (conntrack/NAT pipeline) |
+| `controller/policy_loop.py` | One control cycle: files → policy → weights → status |
+| `controller/policy.py` | Health state machine and load-equalizing control law |
+| `controller/health_probe.py` | Independent HTTP probes from `p1` |
+| `controller/benchmark_modes.py` | adaptive / equal / capacity modes |
+| `controller/runtime.py` | Atomic runtime JSON files, process checks, drains |
+| `controller/cli.py`, `ofctl.py` | Operator commands; read-only OVS inspection |
+| `backend/server.py` | Finite-capacity HTTP backend + telemetry |
+| `topology/lab.py` | Mininet topology, process lifecycle, self-test |
+| `monitoring/` | Dashboard API and static UI |
+| `experiments/` | Load generator, benchmark suite, recovery and session checks |
+| `tests/` | Unit, simulation and OpenFlow-encoding tests |
 
-OVS conntrack and OpenFlow reference:
-- https://docs.openvswitch.org/en/stable/tutorials/ovs-conntrack/
-- https://docs.openvswitch.org/en/stable/ref/ovs-actions.7/
-
-## Milestone 5: FlowScope dashboard
-
-See [MILESTONE5.md](MILESTONE5.md) for the offline React monitoring dashboard, FastAPI commands, real-time backend metrics, experiment controls, benchmark results and troubleshooting.
+References: [OVS conntrack tutorial](https://docs.openvswitch.org/en/stable/tutorials/ovs-conntrack/),
+[OVS actions](https://docs.openvswitch.org/en/stable/ref/ovs-actions.7/),
+[Ryu](https://ryu.readthedocs.io/).

@@ -97,7 +97,7 @@ def main():
     if final <= first:
         raise RuntimeError(f'Recovery weights failed to ramp: {first} -> {final}')
     print(f'PASS: {name} recovered and weight increased {first} -> {final}', flush=True)
-    print('MILESTONE 3 HEALTH/RECOVERY TEST PASSED')
+    print('HEALTH/RECOVERY TEST PASSED')
 
 
 if __name__ == '__main__':
