@@ -86,7 +86,7 @@ Against the real backend servers the same controller converged in about 20 s to
 ## Setup (once)
 
 ```bash
-git clone <this repo> sdn-stateful-lb && cd sdn-stateful-lb
+git clone https://github.com/Zmey1/sdn-stateful-lb.git && cd sdn-stateful-lb
 conda create -n sdn-ryu python=3.9 -y
 conda activate sdn-ryu
 sudo -E bash scripts/setup_ubuntu.sh   # apt packages, Mininet into the env, requirements
