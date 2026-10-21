@@ -14,7 +14,6 @@ import signal
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 
@@ -24,25 +23,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from controller.benchmark_modes import MODE_NAMES
-from controller.config import BACKENDS
-from monitoring.core import Monitor, benchmark_data, pid_alive, read_json
+from controller.cli import restart_backend
+from controller.runtime import (BACKEND_NAMES, atomic_json, pid_alive, read_dict,
+                                set_drain)
+from monitoring.core import Monitor, benchmark_data
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 STATIC = HERE / 'static'
-BACKEND_NAMES = {b.name for b in BACKENDS}
-
-
-def atomic_json(path: Path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix='.dashboard-', suffix='.tmp', dir=path.parent)
-    try:
-        with os.fdopen(fd, 'w') as stream:
-            json.dump(data, stream, indent=2)
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
 
 
 class ModeRequest(BaseModel):
@@ -89,12 +77,11 @@ def create_app(runtime: Path, *, allow_controls=False,
         origin = request.headers.get('origin')
         if origin and origin not in (f'http://127.0.0.1:{port}', f'http://localhost:{port}'):
             raise HTTPException(403, 'Cross-site dashboard control rejected')
-        status = read_json(runtime / 'status.json', {}) or {}
+        status = read_dict(runtime / 'status.json')
         if not (pid_alive(status.get('controller_pid')) and
                 0 <= time.time() - status.get('timestamp', 0) < 8):
             raise HTTPException(409, 'No healthy controller for this runtime')
-        active = read_json(runtime / 'benchmark_active.json', {}) or {}
-        if pid_alive(active.get('pid')):
+        if pid_alive(read_dict(runtime / 'benchmark_active.json').get('pid')):
             raise HTTPException(409, 'A benchmark is running: controls are temporarily locked')
 
     @app.get('/')
@@ -125,14 +112,7 @@ def create_app(runtime: Path, *, allow_controls=False,
         verify_control(request)
         if body.backend not in BACKEND_NAMES:
             raise HTTPException(400, 'Invalid backend')
-        with control_lock:
-            names = read_json(runtime / 'drain.json', []) or []
-            names = set(names) & BACKEND_NAMES if isinstance(names, list) else set()
-            if body.enabled:
-                names.add(body.backend)
-            else:
-                names.discard(body.backend)
-            atomic_json(runtime / 'drain.json', sorted(names))
+        names = set_drain(runtime, body.backend, body.enabled)
         return {'ok': True, 'drains': sorted(names)}
 
     @app.post('/api/control/workload')
@@ -141,8 +121,7 @@ def create_app(runtime: Path, *, allow_controls=False,
         if body.backend not in BACKEND_NAMES:
             raise HTTPException(400, 'Invalid backend')
         with control_lock:
-            current = read_json(runtime / 'workload_profile.json', {}) or {}
-            current = current if isinstance(current, dict) else {}
+            current = read_dict(runtime / 'workload_profile.json')
             # Keep all other backend profiles unchanged.
             current[body.backend] = {'delay_ms': body.delay_ms, 'burn_ms': body.burn_ms}
             atomic_json(runtime / 'workload_profile.json', current)
@@ -155,7 +134,7 @@ def create_app(runtime: Path, *, allow_controls=False,
         name = body.backend
         if name not in BACKEND_NAMES:
             raise HTTPException(400, 'Invalid backend')
-        metrics = read_json(runtime / f'{name}.json', {}) or {}
+        metrics = read_dict(runtime / f'{name}.json')
         try:
             pid = int(metrics.get('pid', -1))
             command = Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0', b' ').decode(errors='replace')
@@ -172,7 +151,6 @@ def create_app(runtime: Path, *, allow_controls=False,
         verify_control(request)
         if body.backend not in BACKEND_NAMES:
             raise HTTPException(400, 'Invalid backend')
-        from controller.cli import restart_backend
         try:
             pid = restart_backend(body.backend, runtime)
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
@@ -191,7 +169,7 @@ def create_app(runtime: Path, *, allow_controls=False,
 
     def launch_traffic(rate, duration):
         try:
-            pids = read_json(runtime / 'host_pids.json', {}) or {}
+            pids = read_dict(runtime / 'host_pids.json')
             pid = int(pids['h1'])
             if not pid_alive(pid):
                 raise RuntimeError('Mininet h1 namespace not running')

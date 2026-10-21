@@ -20,21 +20,17 @@ import time
 from controller.benchmark_modes import MODE_NAMES
 from controller.policy import meaningful_change
 from controller.config import BACKENDS, CLIENTS
+from controller.ofctl import OpenFlowError, ovs
+from controller.runtime import atomic_json as write_json, read_dict
 
 SCENARIOS = ('uniform', 'degraded-b1', 'cpu-b1')
 
 
-def write_json(path: Path, obj) -> None:
-    tmp = path.with_suffix('.tmp')
-    tmp.write_text(json.dumps(obj, indent=2))
-    tmp.replace(path)
-
-
 def read_json(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(f'Cannot read {path}: {exc}') from exc
+    data = read_dict(path)
+    if not data:
+        raise RuntimeError(f'Cannot read {path}')
+    return data
 
 
 def percentile(values, p):
@@ -68,7 +64,7 @@ def summarize(clients: list[dict], measurement_seconds: float):
             'p95_ms': percentile(latencies, 95),
             'p99_ms': percentile(latencies, 99),
             'mean_ms': round(statistics.mean(latencies), 3) if latencies else None,
-            'b1': counts['b1'], 'b2': counts['b2'], 'b3': counts['b3'],
+            **{b.name: counts[b.name] for b in BACKENDS},
             'errors': dict(failures), 'backpressure_rejected': rejected}
 
 
@@ -159,11 +155,8 @@ def process_cpu_seconds(pid):
 
 def group_stats():
     try:
-        return subprocess.run(['ovs-ofctl', '-O', 'OpenFlow13',
-                               'dump-group-stats', 's1'],
-                              capture_output=True, text=True,
-                              check=True, timeout=8).stdout
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return ovs('dump-group-stats')
+    except OpenFlowError:
         return None
 
 
@@ -173,10 +166,7 @@ def backend_telemetry(runtime: Path):
 
 
 def controller_snapshot(runtime: Path):
-    try:
-        return read_json(runtime / 'status.json')
-    except RuntimeError:
-        return {}
+    return read_dict(runtime / 'status.json')
 
 
 def write_table(file: Path, rows: list[dict]):
@@ -287,11 +277,8 @@ def main():
     finally:
         # Dashboard actions must not interfere with an active benchmark.
         active = runtime / 'benchmark_active.json'
-        try:
-            if read_json(active).get('pid') == os.getpid():
-                active.unlink(missing_ok=True)
-        except (OSError, RuntimeError):
-            pass
+        if read_dict(active).get('pid') == os.getpid():
+            active.unlink(missing_ok=True)
         # Restore safe defaults, even if one experiment fails.
         write_json(runtime / 'workload_profile.json', scenario_profile('uniform'))
         write_json(runtime / 'benchmark_mode.json', {'mode': 'adaptive'})

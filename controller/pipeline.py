@@ -95,9 +95,3 @@ def group_text(weights: dict[str, int]) -> str:
     if not buckets:
         buckets.append('bucket=weight=1,actions=drop')
     return f'group_id={GROUP_ID},type=select,' + ','.join(buckets)
-
-
-def validate_distribution(weights: dict[str, int]) -> dict[str, int]:
-    """Check a weight dictionary with the same rules as a group update."""
-    group_text(weights)
-    return {b.name: weights.get(b.name, 0) for b in BACKENDS}

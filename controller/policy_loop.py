@@ -11,40 +11,19 @@ import os
 from pathlib import Path
 import time
 from .config import BACKENDS, BRIDGE
-from .health_probe import atomic_json
+from .runtime import atomic_json, read_dict, read_drains
 from .ofctl import read_installed_weights, update_weights, OpenFlowError
 from .policy import AdaptivePolicy, meaningful_change
 from .benchmark_modes import read_mode, select_weights
 
 
 def read_metrics(directory: Path) -> dict[str, dict]:
-    result = {}
-    for b in BACKENDS:
-        try:
-            entry = json.loads((directory / f'{b.name}.json').read_text())
-            if isinstance(entry, dict):
-                result[b.name] = entry
-        except (OSError, ValueError):
-            pass
-    return result
+    return {b.name: entry for b in BACKENDS
+            if (entry := read_dict(directory / f'{b.name}.json'))}
 
 
 def read_health(directory: Path) -> dict[str, dict]:
-    try:
-        content = json.loads((directory / 'health.json').read_text())
-        return content if isinstance(content, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def read_drains(directory: Path) -> set[str]:
-    try:
-        names = json.loads((directory / 'drain.json').read_text())
-        if isinstance(names, list):
-            return set(names) & {b.name for b in BACKENDS}
-    except (OSError, ValueError):
-        pass
-    return set()
+    return read_dict(directory / 'health.json')
 
 
 def initialize_policy(runtime: Path, installed: dict[str, int]) -> AdaptivePolicy:
@@ -64,15 +43,17 @@ def initialize_policy(runtime: Path, installed: dict[str, int]) -> AdaptivePolic
 
 
 def should_install_weights(previous: dict[str, int], desired: dict[str, int],
-                           mode: str, mode_changed: bool,
-                           changed_members: bool, due: bool) -> bool:
+                           mode: str, mode_changed: bool, due: bool) -> bool:
     """Honor explicit benchmark modes without weakening adaptive hysteresis.
 
     Static modes are exact, and switches into adaptive force its initial
-    weights. Subsequent adaptive updates still use minimum-update + hysteresis.
+    weights. Membership changes (a backend added or removed) are immediate.
+    Other adaptive updates use minimum-update interval + hysteresis.
     """
     if previous == desired:
         return False
+    changed_members = any((previous.get(k, 0) == 0) != (v == 0)
+                          for k, v in desired.items())
     if mode != 'adaptive' or mode_changed or changed_members:
         return True
     return due and meaningful_change(previous, desired)
@@ -107,6 +88,7 @@ def main():
         last_update = time.monotonic() - args.minimum_update
         last_states = None
         last_mode = None
+        mode_error = ''
         try:
             while True:
                 policy.manual_drain = read_drains(args.runtime)
@@ -114,18 +96,20 @@ def main():
                 adaptive_weights = policy.evaluate(read_metrics(args.runtime), health=health)
                 try:
                     benchmark_mode = read_mode(args.runtime)
+                    mode_error = ''
                 except ValueError as exc:
-                    print(f'Benchmark control error: {exc}; keeping previous weights', flush=True)
-                    time.sleep(args.interval)
-                    continue
+                    # Never switch to an unintended policy: keep the last one.
+                    if str(exc) != mode_error:
+                        print(f'Benchmark control error: {exc}; keeping previous mode',
+                              flush=True)
+                    mode_error = str(exc)
+                    benchmark_mode = last_mode or 'adaptive'
                 desired = select_weights(benchmark_mode, adaptive_weights, policy.summary())
-                changed_members = any((previous.get(k, 0) == 0) != (v == 0)
-                                      for k, v in desired.items())
                 due = time.monotonic() - last_update >= args.minimum_update
                 mode_changed = benchmark_mode != last_mode
                 updated = False
                 if should_install_weights(previous, desired, benchmark_mode,
-                                          mode_changed, changed_members, due):
+                                          mode_changed, due):
                     try:
                         update_weights(desired, args.bridge)
                         previous = dict(desired)
@@ -155,7 +139,7 @@ def main():
                 atomic_json(args.runtime / 'status.json', {
                     'timestamp': time.time(), 'controller_pid': os.getpid(),
                     'installed_weights': previous, 'desired_weights': desired,
-                    'benchmark_mode': benchmark_mode,
+                    'benchmark_mode': benchmark_mode, 'mode_error': mode_error,
                     'backends': summary,
                 })
                 time.sleep(args.interval)

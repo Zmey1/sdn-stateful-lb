@@ -14,14 +14,12 @@ import subprocess
 import sys
 import time
 from controller.cli import restart_backend
-from controller.config import BACKENDS
+from controller.config import BACKENDS, VIP, VPORT
+from controller.runtime import read_dict
 
 
 def status(runtime: Path) -> dict:
-    try:
-        return json.loads((runtime / 'status.json').read_text())
-    except (OSError, ValueError):
-        return {}
+    return read_dict(runtime / 'status.json')
 
 
 def wait_state(runtime: Path, name: str, expected: str,
@@ -45,7 +43,7 @@ def verify_new_connections(runtime: Path, excluded: str, count: int) -> None:
     hosts = json.loads((runtime / 'host_pids.json').read_text())
     script = '''import http.client,json,sys
 for i in range(int(sys.argv[1])):
-    conn=http.client.HTTPConnection("10.0.3.100",8080,timeout=2)
+    conn=http.client.HTTPConnection(sys.argv[3],int(sys.argv[4]),timeout=2)
     try:
         conn.request("GET","/work",headers={"Connection":"close"})
         res=conn.getresponse()
@@ -57,12 +55,12 @@ for i in range(int(sys.argv[1])):
         conn.close()
 '''
     cmd = ['mnexec', '-a', str(hosts['h1']), sys.executable, '-c',
-           script, str(count), excluded]
+           script, str(count), excluded, VIP, str(VPORT)]
     proc = subprocess.run(cmd, text=True, capture_output=True, timeout=max(20, count * 3))
     if proc.returncode:
         raise RuntimeError(f'New-connection test failed: {proc.stdout}\n{proc.stderr}')
     print(f'PASS: {count} new TCP connections avoided {excluded} '
-          f'(targets: {dict((n, proc.stdout.splitlines().count(n)) for n in ("b1", "b2", "b3"))})')
+          f'(targets: {dict((n, proc.stdout.splitlines().count(n)) for n in (b.name for b in BACKENDS))})')
 
 
 def main():

@@ -1,4 +1,4 @@
-"""One-bridge Mininet lab. Run as root: sudo python3 -m topology.lab.
+"""One-bridge Mininet lab. Run as root: sudo $CONDA_PREFIX/bin/python -m topology.lab
 
 No controller participates in packet forwarding. Controller-style OpenFlow
 messages are pushed by ovs-ofctl; OVS performs selection, tracking and NAT.
@@ -13,7 +13,7 @@ import tempfile
 import time
 
 from controller.config import (ALL, BACKENDS, CLIENTS, PROBE, BRIDGE, GATEWAY_MAC,
-                               CLIENT_GW, BACKEND_GW, VIP)
+                               CLIENT_GW, BACKEND_GW, VIP, VPORT)
 from controller.ofctl import install, ports_from_switch, update_weights
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,7 +31,7 @@ def wait_for(path: Path, timeout: float, process=None):
 
 def main():
     if os.geteuid():
-        raise SystemExit('Run as root: sudo python3 -m topology.lab')
+        raise SystemExit('Run as root: sudo "$CONDA_PREFIX/bin/python" -m topology.lab')
     # Mininet is imported only here, so pure Python unit tests run elsewhere.
     try:
         from mininet.net import Mininet
@@ -54,8 +54,7 @@ def main():
         def build(self):
             s = self.addSwitch(BRIDGE, protocols='OpenFlow13', failMode='secure')
             for e in ALL:
-                subnet = '24'
-                h = self.addHost(e.name, ip=e.ip + '/' + subnet, mac=e.mac)
+                h = self.addHost(e.name, ip=f'{e.ip}/24', mac=e.mac)
                 self.addLink(h, s)
 
     setLogLevel('info')
@@ -87,7 +86,6 @@ def main():
         # Bootstrap fail closed before starting any server; group weights will
         # be made live immediately after all three healthy servers start.
         install(ports, BRIDGE)
-        update_weights({}, BRIDGE)
 
         env = os.environ.copy()
         env['PYTHONPATH'] = str(ROOT)
@@ -124,7 +122,7 @@ def main():
         else:
             update_weights({'b1': 100, 'b2': 100, 'b3': 100}, BRIDGE)
 
-        print(f'VIP: http://{VIP}:8080/ | Logs/metrics: {runtime}')
+        print(f'VIP: http://{VIP}:{VPORT}/ | Logs/metrics: {runtime}')
         if args.self_test:
             ready, go, result = (runtime / 'ready.json', runtime / 'go.flag',
                                   runtime / 'result.json')
@@ -146,9 +144,9 @@ def main():
                 raise RuntimeError(f'Persistence test failed: see {runtime / "experiment.log"}')
             print('PASS: session identity and source ports stable across group MOD')
         else:
-            print('Try: h1 curl -s http://10.0.3.100:8080/work')
+            print(f'Try: h1 curl -s http://{VIP}:{VPORT}/work')
             print('In another terminal, run:')
-            print('sudo python3 -m controller.cli --runtime ' + str(runtime) + ' mode equal')
+            print(f'sudo {sys.executable} -m controller.cli mode equal --runtime {runtime}')
             print('Type exit to shut down this Mininet lab.')
             CLI(net)
     finally:

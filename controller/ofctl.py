@@ -6,7 +6,7 @@ control-plane client and can be replaced by OS-Ken message transport later.
 from __future__ import annotations
 import subprocess
 import re
-from .config import BRIDGE, BACKENDS, GROUP_ID
+from .config import ALL, BRIDGE, BACKENDS, GROUP_ID
 from .pipeline import group_text, flow_lines
 
 
@@ -27,11 +27,16 @@ def ovs(*args: str, bridge: str = BRIDGE, input_text: str | None = None) -> str:
 
 def install(ports: dict[str, int], bridge: str = BRIDGE) -> None:
     # Explicitly NOT using NORMAL or standalone fail-mode fallback.
-    subprocess.run(['ovs-vsctl', 'set-fail-mode', bridge, 'secure'], check=True)
-    # Clean only this lab bridge, never global conntrack state.
+    try:
+        subprocess.run(['ovs-vsctl', 'set-fail-mode', bridge, 'secure'],
+                       check=True, capture_output=True, text=True, timeout=15)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        raise OpenFlowError(f'set-fail-mode: {getattr(exc, "stderr", "") or exc}') from exc
+    # Clean only this lab bridge, never global conntrack state. The group
+    # starts fail-closed; the caller enables backends once they are serving.
     ovs('del-flows', bridge)
     ovs('del-groups', bridge)
-    ovs('add-group', bridge, group_text({'b1': 100, 'b2': 100, 'b3': 100}))
+    ovs('add-group', bridge, group_text({}))
     ovs('add-flows', bridge, '-', input_text='\n'.join(flow_lines(ports)) + '\n')
     check_installed(bridge)
 
@@ -89,6 +94,26 @@ def check_installed(bridge: str = BRIDGE, expected: dict[str, int] | None = None
             raise OpenFlowError(f'Group readback mismatch: wanted={wanted}, actual={installed}')
 
 
+def parse_group_stats(output: str) -> dict:
+    """Packet counters of the SELECT group from `ovs-ofctl dump-group-stats`.
+
+    Only TCP SYNs reach the group, so bucket packet counts are the number of
+    new connections the switch actually sent to each live bucket.
+    """
+    line = next((line for line in output.splitlines()
+                 if re.search(rf'\bgroup_id={GROUP_ID}\b', line)), None)
+    if line is None:
+        return {'packet_count': None, 'bucket_counts': []}
+    total = re.search(r'(?<!:)packet_count=(\d+)', line)
+    return {'packet_count': int(total.group(1)) if total else None,
+            'bucket_counts': [int(n) for n in
+                              re.findall(r'bucket\d+:packet_count=(\d+)', line)]}
+
+
+def read_group_stats(bridge: str = BRIDGE) -> dict:
+    return parse_group_stats(ovs('dump-group-stats', bridge))
+
+
 def show(bridge: str = BRIDGE) -> str:
     return ('GROUPS\n' + ovs('dump-groups', bridge)
             + '\nFLOWS\n' + ovs('dump-flows', bridge))
@@ -96,11 +121,9 @@ def show(bridge: str = BRIDGE) -> str:
 
 def ports_from_switch(bridge: str = BRIDGE) -> dict[str, int]:
     """Read actual Mininet OVS ports; do not assume stable allocation."""
-    import json
-    from .config import ALL
     ports = {}
-    for x in ALL:
-        interface = f'{bridge}-eth{list(ALL).index(x) + 1}'
+    for index, x in enumerate(ALL, start=1):
+        interface = f'{bridge}-eth{index}'
         proc = subprocess.run(['ovs-vsctl', 'get', 'Interface', interface,
                                'ofport'], text=True, capture_output=True, check=True)
         ports[x.name] = int(proc.stdout.strip())

@@ -58,7 +58,7 @@ if [[ ! -f topology/lab.py || ! -f monitoring/server.py ]]; then
 fi
 if ! "$CONDA_PY" -c 'import fastapi, uvicorn' 2>/dev/null; then
   echo 'Dashboard dependencies missing in Conda. Run:' >&2
-  echo '  python -m pip install -r requirements-dashboard.txt' >&2
+  echo '  python -m pip install -r requirements.txt' >&2
   exit 1
 fi
 if ! command -v ovs-vsctl >/dev/null || ! command -v ovs-ofctl >/dev/null; then
@@ -69,8 +69,8 @@ fi
 # Authenticate while still at an interactive prompt; background jobs never
 # attempt an unexpected password prompt.
 sudo -v
-if ! sudo /usr/bin/python3 -c 'import mininet' 2>/dev/null; then
-  echo 'System Python cannot import Mininet. Install it via scripts/setup_ubuntu.sh.' >&2
+if ! sudo "$CONDA_PY" -c 'import mininet' 2>/dev/null; then
+  echo 'sdn-ryu Python cannot import Mininet. Run: sudo bash scripts/setup_ubuntu.sh' >&2
   exit 1
 fi
 if sudo ovs-vsctl br-exists s1; then
@@ -101,7 +101,7 @@ if (( BENCH_OVERRIDE )) && ! sudo test -d "$BENCH_ROOT"; then
 fi
 if (( ! BENCH_OVERRIDE )); then
   # Only read historic benchmark results; never modify them.
-  BENCH_ROOT="$(sudo /usr/bin/python3 - <<'PY'
+  BENCH_ROOT="$(sudo "$CONDA_PY" - <<'PY'
 from pathlib import Path
 candidates = []
 for results in Path('/tmp').glob('sdn-lb-*/bench_results'):
@@ -227,7 +227,7 @@ watch_runtime() (
   # and may terminate before it ever writes status.json.
   local ready_controller=0
   for (( tries=0; tries<75; tries++ )); do
-    if sudo -n /usr/bin/python3 - "$runtime" <<'CONTROLLER_READY'
+    if sudo -n "$CONDA_PY" - "$runtime" <<'CONTROLLER_READY'
 import json
 import os
 from pathlib import Path
@@ -270,9 +270,9 @@ CONTROLLER_READY
 
 watch_runtime &
 watcher_pid=$!
-echo "[FlowScope] Starting Mininet. Conda dashboard Python: $CONDA_PY"
+echo "[FlowScope] Starting Mininet. Python: $CONDA_PY"
 echo '[FlowScope] No separate dashboard terminal or manual runtime path needed.'
 
 # Keep sys.stdin attached to the current terminal: Mininet CLI stays usable.
 # Force unbuffered Python output so the background watcher gets the runtime.
-sudo env PYTHONUNBUFFERED=1 /usr/bin/python3 -u -m topology.lab --adaptive 2>&1 | tee "$LAUNCH_LOG"
+sudo env PYTHONUNBUFFERED=1 "$CONDA_PY" -u -m topology.lab --adaptive 2>&1 | tee "$LAUNCH_LOG"

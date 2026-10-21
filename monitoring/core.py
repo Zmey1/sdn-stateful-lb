@@ -3,26 +3,17 @@ from __future__ import annotations
 
 from collections import deque
 import csv
-import json
 import math
 import os
 from pathlib import Path
-import re
-import subprocess
 import threading
 import time
 
-from controller.config import BACKENDS
+from controller.config import BACKENDS, VIP, VPORT
+from controller.ofctl import OpenFlowError, read_group_stats
+from controller.runtime import pid_alive, read_dict, read_drains
 
 NAMES = tuple(b.name for b in BACKENDS)
-
-
-def read_json(path: Path, default=None):
-    try:
-        data = json.loads(path.read_text())
-        return data
-    except (OSError, UnicodeError, ValueError):
-        return default
 
 
 def finite_float(value, fallback=0.0):
@@ -31,18 +22,6 @@ def finite_float(value, fallback=0.0):
         return result if math.isfinite(result) else fallback
     except (ValueError, TypeError):
         return fallback
-
-
-def pid_alive(pid):
-    try:
-        pid = int(pid)
-        if pid < 2:
-            return False
-        raw = Path(f'/proc/{pid}/stat').read_text()
-        # Linux zombies don't serve requests even if kill(pid, 0) succeeds.
-        return not raw.rsplit(') ', 1)[1].startswith('Z ')
-    except (OSError, ValueError, TypeError, IndexError):
-        return False
 
 
 def controller_events(runtime: Path, limit=30):
@@ -115,20 +94,8 @@ class Monitor:
             return dict(self._group_cache)
         group = dict(self._group_cache)
         try:
-            output = subprocess.run(
-                ['ovs-ofctl', '-O', 'OpenFlow13', 'dump-group-stats', 's1'],
-                capture_output=True, text=True, check=True, timeout=2).stdout
-            match = re.search(r'group_id=100\b[^\n]*', output)
-            if match:
-                line = match.group()
-                x = re.search(r'(?<!:)packet_count=(\d+)', line)
-                group['packet_count'] = int(x.group(1)) if x else None
-                group['bucket_counts'] = [int(n) for n in re.findall(
-                    r'bucket\d+:packet_count=(\d+)', line)]
-            else:
-                group['packet_count'] = None
-                group['bucket_counts'] = []
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            group.update(read_group_stats())
+        except OpenFlowError:
             pass  # Optional counters cannot make the dashboard unavailable.
         group['updated'] = now
         self._group_cache = group
@@ -138,14 +105,10 @@ class Monitor:
         with self._lock:
             runtime = self.runtime
             now = time.time()
-            status = read_json(runtime / 'status.json', {})
-            status = status if isinstance(status, dict) else {}
-            probes = read_json(runtime / 'health.json', {})
-            probes = probes if isinstance(probes, dict) else {}
-            drains = read_json(runtime / 'drain.json', [])
-            drains = drains if isinstance(drains, list) else []
-            profile = read_json(runtime / 'workload_profile.json', {})
-            profile = profile if isinstance(profile, dict) else {}
+            status = read_dict(runtime / 'status.json')
+            probes = read_dict(runtime / 'health.json')
+            drains = read_drains(runtime)
+            profile = read_dict(runtime / 'workload_profile.json')
             installed = status.get('installed_weights') or {}
             desired = status.get('desired_weights') or {}
             summary = status.get('backends') or {}
@@ -155,8 +118,7 @@ class Monitor:
             counts = {}
             for backend in BACKENDS:
                 name = backend.name
-                data = read_json(runtime / f'{name}.json', {})
-                data = data if isinstance(data, dict) else {}
+                data = read_dict(runtime / f'{name}.json')
                 health = probes.get(name) or {}
                 state = summary.get(name) or {}
                 baseline = profile.get(name) or {}
@@ -207,16 +169,15 @@ class Monitor:
             self.history.append({'timestamp': now, 'rps': total_rate,
                                  'cpu': {s['name']: s['cpu_pct'] for s in servers},
                                  'weight': {s['name']: s['weight'] for s in servers}})
-            active_job = read_json(runtime / 'dashboard_traffic.json', {}) or {}
-            benchmark_active = read_json(runtime / 'benchmark_active.json', {}) or {}
-            if not pid_alive(benchmark_active.get('pid')):
-                benchmark_active = {}
+            active_job = read_dict(runtime / 'dashboard_traffic.json')
+            benchmark_active = pid_alive(
+                read_dict(runtime / 'benchmark_active.json').get('pid'))
             return {
-                'timestamp': now, 'runtime': str(runtime), 'vip': '10.0.3.100:8080',
+                'timestamp': now, 'runtime': str(runtime), 'vip': f'{VIP}:{VPORT}',
                 'controller': controller, 'backends': servers,
                 'total_rps': total_rate, 'window_requests': total_delta,
                 'history': list(self.history),
                 'events': controller_events(runtime),
                 'group': self._group_stats(),
-                'traffic_job': active_job, 'benchmark_active': bool(benchmark_active),
+                'traffic_job': active_job, 'benchmark_active': benchmark_active,
             }

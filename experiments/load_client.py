@@ -13,7 +13,9 @@ import json
 import math
 import threading
 import time
-from controller.config import VIP, VPORT
+from controller.config import BACKENDS, VIP, VPORT
+
+BACKEND_NAMES = {b.name for b in BACKENDS}
 
 
 def request_once(timeout: float = 3.0) -> tuple[float, str | None, str | None]:
@@ -26,7 +28,7 @@ def request_once(timeout: float = 3.0) -> tuple[float, str | None, str | None]:
         if reply.status != 200:
             raise RuntimeError(f'HTTP {reply.status}')
         server = json.loads(body).get('server')
-        if server not in ('b1', 'b2', 'b3'):
+        if server not in BACKEND_NAMES:
             raise RuntimeError('Response without valid backend identity')
         return (1000 * (time.perf_counter() - begin), server, None)
     except (OSError, RuntimeError, ValueError, http.client.HTTPException) as exc:

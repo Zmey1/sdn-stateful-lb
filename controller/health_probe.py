@@ -11,12 +11,7 @@ from pathlib import Path
 import time
 from http.client import HTTPConnection
 from .config import BACKENDS
-
-
-def atomic_json(path: Path, data: dict) -> None:
-    tmp = path.with_suffix('.tmp')
-    tmp.write_text(json.dumps(data, sort_keys=True))
-    tmp.replace(path)
+from .runtime import atomic_json
 
 
 def probe_backend(backend, timeout: float = .75) -> dict:

@@ -8,6 +8,7 @@ import http.client
 import json
 from pathlib import Path
 import time
+from controller.config import VIP, VPORT
 
 
 def probe_once(connection: http.client.HTTPConnection):
@@ -48,8 +49,8 @@ def run(vip, port, connections, ready: Path, go: Path, result: Path):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--vip', default='10.0.3.100')
-    p.add_argument('--port', type=int, default=8080)
+    p.add_argument('--vip', default=VIP)
+    p.add_argument('--port', type=int, default=VPORT)
     p.add_argument('--connections', type=int, default=30)
     for name in ['ready', 'go', 'result']:
         p.add_argument('--' + name, required=True, type=Path)
