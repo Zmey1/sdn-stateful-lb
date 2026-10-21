@@ -10,7 +10,6 @@ import threading
 import time
 
 from controller.config import BACKENDS, VIP, VPORT
-from controller.ofctl import OpenFlowError, read_group_stats
 from controller.runtime import pid_alive, read_dict, read_drains
 
 NAMES = tuple(b.name for b in BACKENDS)
@@ -85,21 +84,6 @@ class Monitor:
         self._lock = threading.Lock()
         self._last_counters = {}
         self._last_sample_at = 0.0
-        self._group_cache = {'updated': 0.0, 'packet_count': None,
-                             'bucket_counts': []}
-
-    def _group_stats(self):
-        now = time.monotonic()
-        if now - self._group_cache['updated'] < 4:
-            return dict(self._group_cache)
-        group = dict(self._group_cache)
-        try:
-            group.update(read_group_stats())
-        except OpenFlowError:
-            pass  # Optional counters cannot make the dashboard unavailable.
-        group['updated'] = now
-        self._group_cache = group
-        return dict(group)
 
     def snapshot(self):
         with self._lock:
@@ -181,6 +165,5 @@ class Monitor:
                 'total_rps': total_rate, 'window_requests': total_delta,
                 'history': list(self.history),
                 'events': controller_events(runtime),
-                'group': self._group_stats(),
                 'traffic_job': active_job, 'benchmark_active': benchmark_active,
             }

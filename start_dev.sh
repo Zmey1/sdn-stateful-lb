@@ -245,7 +245,7 @@ try:
     if stat.startswith('Z '):
         raise ValueError('controller is a zombie')
     cmdline = Path('/proc/{}/cmdline'.format(pid)).read_bytes()
-    if b'controller.policy_loop' not in cmdline:
+    if b'controller.lb_app' not in cmdline:
         raise ValueError('status PID is not the policy controller')
 except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
     sys.exit(1)
@@ -275,4 +275,4 @@ echo '[FlowScope] No separate dashboard terminal or manual runtime path needed.'
 
 # Keep sys.stdin attached to the current terminal: Mininet CLI stays usable.
 # Force unbuffered Python output so the background watcher gets the runtime.
-sudo env PYTHONUNBUFFERED=1 "$CONDA_PY" -u -m topology.lab --adaptive 2>&1 | tee "$LAUNCH_LOG"
+sudo env PYTHONUNBUFFERED=1 "$CONDA_PY" -u -m topology.lab 2>&1 | tee "$LAUNCH_LOG"

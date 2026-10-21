@@ -21,7 +21,6 @@ import time
 from controller.benchmark_modes import MODE_NAMES
 from controller.policy import meaningful_change
 from controller.config import BACKENDS, CLIENTS
-from controller.ofctl import OpenFlowError, ovs
 from controller.runtime import atomic_json as write_json, read_dict
 
 SCENARIOS = ('uniform', 'slow-b1', 'step-b1')
@@ -176,13 +175,6 @@ def process_cpu_seconds(pid):
         return None
 
 
-def group_stats():
-    try:
-        return ovs('dump-group-stats')
-    except OpenFlowError:
-        return None
-
-
 def backend_telemetry(runtime: Path):
     return {b.name: read_json(runtime / f'{b.name}.json')
             for b in BACKENDS}
@@ -228,7 +220,7 @@ def main():
     # Require a live controller that understands benchmark modes.
     status = controller_snapshot(runtime)
     if 'benchmark_mode' not in status or time.time() - status.get('timestamp', 0) > 8:
-        p.error('No live policy controller: start the lab with --adaptive')
+        p.error('No live policy controller: start the lab first (./start_dev.sh)')
     root = runtime / 'bench_results' / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     root.mkdir(parents=True, exist_ok=True)
     write_json(runtime / 'benchmark_active.json', {'pid': os.getpid(), 'started': time.time()})
@@ -251,7 +243,6 @@ def main():
                     time.sleep(args.settle)
                 before = controller_snapshot(runtime)
                 ctl_cpu_before = process_cpu_seconds(before.get('controller_pid'))
-                stats_before = group_stats()
                 telemetry_before = backend_telemetry(runtime)
                 print(f'  {mode} run {repeat}: weights={before.get("installed_weights")}',
                       flush=True)
@@ -273,7 +264,6 @@ def main():
                     recorder.join()
                 after = controller_snapshot(runtime)
                 ctl_cpu_after = process_cpu_seconds(after.get('controller_pid'))
-                stats_after = group_stats()
                 telemetry_after = backend_telemetry(runtime)
                 metrics = summarize(clients, args.duration)
                 ctl_cpu = (round(100*(ctl_cpu_after-ctl_cpu_before)/args.duration, 3)
@@ -287,8 +277,6 @@ def main():
                             'weights_before': before.get('installed_weights'),
                             'weights_after': after.get('installed_weights'),
                             'status_before': before, 'status_after': after,
-                            'ovs_group_stats_before': stats_before,
-                            'ovs_group_stats_after': stats_after,
                             'telemetry_before': telemetry_before,
                             'telemetry_after': telemetry_after,
                             'timeline': timeline, 'clients': clients}

@@ -1,22 +1,22 @@
-"""Out-of-band control plane. Does not handle forwarded packets.
+"""Transport-independent control step of the load balancer.
 
-Health is measured by an independent Mininet p1 probe process. Controller
-restarts read existing group weights and cached health/policy state rather than
-reinstalling flows (which would disrupt established conntrack sessions).
+Each step reads the lab runtime files (probe results, backend telemetry,
+drains, benchmark mode), evaluates the policy, decides whether new SELECT
+weights should be installed, and publishes status.json. The Ryu app
+(controller/lb_app.py) supplies the switch's installed weights and group
+counters and sends the resulting OpenFlow messages.
 """
 from __future__ import annotations
 
-import argparse
-import fcntl
 import json
 import os
 from pathlib import Path
 import time
-from .config import BACKENDS, BRIDGE
-from .runtime import atomic_json, read_dict, read_drains
-from .ofctl import read_group_stats, read_installed_weights, update_weights, OpenFlowError
-from .policy import AdaptivePolicy, meaningful_change
+
 from .benchmark_modes import read_mode, select_weights
+from .config import BACKENDS
+from .policy import AdaptivePolicy, meaningful_change
+from .runtime import atomic_json, read_dict, read_drains
 
 
 def read_metrics(directory: Path) -> dict[str, dict]:
@@ -64,7 +64,6 @@ def initialize_policy(runtime: Path, installed: dict[str, int]) -> AdaptivePolic
     return policy
 
 
-
 def should_install_weights(previous: dict[str, int], desired: dict[str, int],
                            mode: str, mode_changed: bool, due: bool) -> bool:
     """Honor explicit benchmark modes without weakening adaptive hysteresis.
@@ -81,107 +80,73 @@ def should_install_weights(previous: dict[str, int], desired: dict[str, int],
         return True
     return due and meaningful_change(previous, desired)
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--runtime', required=True, type=Path)
-    p.add_argument('--bridge', default=BRIDGE)
-    p.add_argument('--interval', type=float, default=2.0)
-    p.add_argument('--minimum-update', type=float, default=5.0)
-    args = p.parse_args()
-    if args.interval <= 0 or args.minimum_update <= 0:
-        p.error('interval and minimum-update must be positive')
-    args.runtime.mkdir(parents=True, exist_ok=True)
 
-    # Prevent two independent control loops from fighting over SELECT weights.
-    with (args.runtime / 'controller.lock').open('w') as lock:
+class PolicyLoop:
+    def __init__(self, runtime: Path, installed: dict[str, int],
+                 minimum_update: float = 5.0):
+        self.runtime = runtime
+        self.minimum_update = minimum_update
+        self.policy = initialize_policy(runtime, installed)
+        self.last_update = time.monotonic() - minimum_update
+        self.last_mode = None
+        self.mode_error = ''
+        self.last_states = None
+        self.last_counters = None
+
+    def _read_mode(self) -> str:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit('Another controller is already managing this runtime')
-        try:
-            previous = read_installed_weights(args.bridge)
-        except OpenFlowError as exc:
-            raise SystemExit(f'Unable to reconcile live switch: {exc}. '
-                             'Start the Mininet lab first.') from exc
+            mode = read_mode(self.runtime)
+            self.mode_error = ''
+            return mode
+        except ValueError as exc:
+            # Never switch to an unintended policy: keep the last one.
+            if str(exc) != self.mode_error:
+                print(f'Benchmark control error: {exc}; keeping previous mode', flush=True)
+            self.mode_error = str(exc)
+            return self.last_mode or 'adaptive'
 
-        policy = initialize_policy(args.runtime, previous)
-        (args.runtime / 'controller.pid').write_text(str(os.getpid()))
-        print(f'Controller PID {os.getpid()}, reconciled installed weights={previous}',
-              flush=True)
-        last_update = time.monotonic() - args.minimum_update
-        last_states = None
-        last_mode = None
-        mode_error = ''
-        last_counters = None
-        try:
-            while True:
-                try:
-                    counters = read_group_stats(args.bridge)
-                except OpenFlowError:
-                    counters = None
-                observed = connection_shares(last_counters, counters, previous)
-                last_counters = counters
-                policy.manual_drain = read_drains(args.runtime)
-                health = read_health(args.runtime)
-                adaptive_weights = policy.evaluate(read_metrics(args.runtime), health=health)
-                try:
-                    benchmark_mode = read_mode(args.runtime)
-                    mode_error = ''
-                except ValueError as exc:
-                    # Never switch to an unintended policy: keep the last one.
-                    if str(exc) != mode_error:
-                        print(f'Benchmark control error: {exc}; keeping previous mode',
-                              flush=True)
-                    mode_error = str(exc)
-                    benchmark_mode = last_mode or 'adaptive'
-                desired = select_weights(benchmark_mode, adaptive_weights, policy.summary())
-                due = time.monotonic() - last_update >= args.minimum_update
-                mode_changed = benchmark_mode != last_mode
-                updated = False
-                if should_install_weights(previous, desired, benchmark_mode,
-                                          mode_changed, due):
-                    try:
-                        update_weights(desired, args.bridge)
-                        previous = dict(desired)
-                        last_update = time.monotonic()
-                        updated = True
-                        last_counters = None  # buckets were rebuilt
-                    except OpenFlowError as exc:
-                        print(f'OpenFlow update failed: {exc}', flush=True)
-                        # Resync to switch as source of truth if command
-                        # succeeded but its readback failed (or manual edit).
-                        try:
-                            previous = read_installed_weights(args.bridge)
-                        except OpenFlowError:
-                            pass
-                        last_counters = None
-                # Remember a mode only after its desired weights are installed.
-                # If an update fails, retry on the next controller iteration.
-                if previous == desired:
-                    last_mode = benchmark_mode
-                summary = policy.summary()
-                states = {n: s['state'] for n, s in summary.items()}
-                if updated or states != last_states:
-                    print(f'weights={previous}, desired={desired}, states={states}',
-                          flush=True)
-                    last_states = states
-                # Snapshot actual installed weights, not a pending proposal.
-                policy.last_weights = dict(previous)
-                atomic_json(args.runtime / 'policy_state.json', policy.snapshot())
-                atomic_json(args.runtime / 'status.json', {
-                    'timestamp': time.time(), 'controller_pid': os.getpid(),
-                    'installed_weights': previous, 'desired_weights': desired,
-                    'observed_share': observed,
-                    'benchmark_mode': benchmark_mode, 'mode_error': mode_error,
-                    'backends': summary,
-                })
-                time.sleep(args.interval)
-        finally:
-            try:
-                (args.runtime / 'controller.pid').unlink(missing_ok=True)
-            except OSError:
-                pass
+    def step(self, installed: dict[str, int], counters: dict | None,
+             connected: bool = True) -> dict[str, int] | None:
+        """Run one control cycle; return weights to install now, or None.
 
+        `installed` is what the switch reported; `counters` the latest
+        SELECT group counters. The caller treats a returned weight set as
+        installed unless the switch reports otherwise.
+        """
+        observed = connection_shares(self.last_counters, counters, installed)
+        self.last_counters = counters
+        self.policy.manual_drain = read_drains(self.runtime)
+        adaptive = self.policy.evaluate(read_metrics(self.runtime),
+                                        read_health(self.runtime))
+        mode = self._read_mode()
+        desired = select_weights(mode, adaptive, self.policy.summary())
+        due = time.monotonic() - self.last_update >= self.minimum_update
+        install = connected and should_install_weights(
+            installed, desired, mode, mode != self.last_mode, due)
+        if install:
+            installed = dict(desired)
+            self.last_update = time.monotonic()
+            self.last_counters = None  # buckets are rebuilt by the group MOD
+        # Remember a mode only after its weights are installed; otherwise the
+        # next cycle retries the forced switch.
+        if installed == desired:
+            self.last_mode = mode
 
-if __name__ == '__main__':
-    main()
+        summary = self.policy.summary()
+        states = {n: s['state'] for n, s in summary.items()}
+        if install or states != self.last_states:
+            print(f'weights={installed}, desired={desired}, states={states}', flush=True)
+            self.last_states = states
+        # Snapshot actual installed weights, not a pending proposal.
+        self.policy.last_weights = dict(installed)
+        atomic_json(self.runtime / 'policy_state.json', self.policy.snapshot())
+        atomic_json(self.runtime / 'status.json', {
+            'timestamp': time.time(), 'controller_pid': os.getpid(),
+            'switch_connected': connected,
+            'installed_weights': installed, 'desired_weights': desired,
+            'observed_share': observed,
+            'group_packets': counters.get('packet_count') if counters else None,
+            'benchmark_mode': mode, 'mode_error': self.mode_error,
+            'backends': summary,
+        })
+        return desired if install else None

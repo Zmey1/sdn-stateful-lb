@@ -1,6 +1,5 @@
 import json
 import os
-from pathlib import Path
 import time
 
 from fastapi.testclient import TestClient
@@ -32,8 +31,7 @@ def runtime(tmp_path):
     return tmp_path
 
 
-def test_dashboard_reads_real_status(runtime, monkeypatch):
-    monkeypatch.setattr(Monitor, '_group_stats', lambda self: {'packet_count': 0})
+def test_dashboard_reads_real_status(runtime):
     with TestClient(create_app(runtime)) as client:
         page = client.get('/')
         assert page.status_code == 200 and 'FlowScope' in page.text
@@ -49,16 +47,14 @@ def test_dashboard_reads_real_status(runtime, monkeypatch):
         assert data['backends'][0]['observed_share_pct'] == 20
 
 
-def test_no_controls_unless_opted_in(runtime, monkeypatch):
-    monkeypatch.setattr(Monitor, '_group_stats', lambda self: {})
+def test_no_controls_unless_opted_in(runtime):
     with TestClient(create_app(runtime)) as client:
         r = client.post('/api/control/mode', json={'mode': 'equal'})
         assert r.status_code == 403
         assert not (runtime/'benchmark_mode.json').exists()
 
 
-def test_controls_write_only_bounded_known_files(runtime, monkeypatch):
-    monkeypatch.setattr(Monitor, '_group_stats', lambda self: {})
+def test_controls_write_only_bounded_known_files(runtime):
     with TestClient(create_app(runtime, allow_controls=True)) as client:
         assert client.post('/api/control/mode',json={'mode':'equal'}).status_code == 200
         assert json.loads((runtime/'benchmark_mode.json').read_text()) == {'mode':'equal'}
@@ -74,24 +70,21 @@ def test_controls_write_only_bounded_known_files(runtime, monkeypatch):
         assert json.loads((runtime/'workload_profile.json').read_text())['b1']['delay_ms'] == 0
 
 
-def test_control_rejects_other_browser_origins(runtime, monkeypatch):
-    monkeypatch.setattr(Monitor, '_group_stats', lambda self: {})
+def test_control_rejects_other_browser_origins(runtime):
     with TestClient(create_app(runtime, allow_controls=True)) as client:
         r = client.post('/api/control/drain', json={'backend':'b2','enabled':True},
                         headers={'Origin':'https://bad.example'})
         assert r.status_code == 403
 
 
-def test_benchmark_blocks_mutations(runtime, monkeypatch):
-    monkeypatch.setattr(Monitor, '_group_stats', lambda self: {})
+def test_benchmark_blocks_mutations(runtime):
     (runtime/'benchmark_active.json').write_text(json.dumps({'pid':os.getpid()}))
     with TestClient(create_app(runtime, allow_controls=True)) as client:
         assert client.post('/api/control/mode',json={'mode':'capacity'}).status_code == 409
         assert client.get('/api/snapshot').json()['benchmark_active'] is True
 
 
-def test_stale_controller_blocks_controls(runtime, monkeypatch):
-    monkeypatch.setattr(Monitor, '_group_stats', lambda self: {})
+def test_stale_controller_blocks_controls(runtime):
     status=json.loads((runtime/'status.json').read_text())
     status['timestamp']-=100
     (runtime/'status.json').write_text(json.dumps(status))
@@ -110,8 +103,7 @@ def test_benchmark_csv_loading(runtime):
     assert result['summary'][0]['mode']=='adaptive'
 
 
-def test_monitor_counts_actual_completions(runtime,monkeypatch):
-    monkeypatch.setattr(Monitor, '_group_stats', lambda self: {})
+def test_monitor_counts_actual_completions(runtime):
     monitor=Monitor(runtime)
     monitor.snapshot()
     monitor._last_sample_at-=2
@@ -130,8 +122,7 @@ def test_missing_log_and_unreadable_benchmark(runtime):
     assert pid_alive(-1) is False
 
 
-def test_fault_controls_only_named_backends(runtime, monkeypatch):
-    monkeypatch.setattr(Monitor, '_group_stats', lambda self: {})
+def test_fault_controls_only_named_backends(runtime):
     with TestClient(create_app(runtime, allow_controls=True)) as client:
         assert client.post('/api/control/crash', json={'backend':'../../etc'}).status_code == 400
         # Fixture is not an actual live backend; must not kill arbitrary PID.

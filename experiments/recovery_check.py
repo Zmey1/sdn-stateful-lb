@@ -1,6 +1,6 @@
 """Live Mininet integration experiment: backend crash -> exclusion -> recovery.
 
-Run from a second terminal while `sudo python3 -m topology.lab --adaptive`
+Run from a second terminal while the lab (./start_dev.sh)
 is active. Only changes the named backend worker in this throwaway lab.
 """
 from __future__ import annotations
@@ -72,7 +72,7 @@ def main():
     if os.geteuid():
         p.error('Run as root')
     if not args.runtime.joinpath('host_pids.json').exists():
-        p.error('Live Mininet runtime not found; start --adaptive first')
+        p.error('Live Mininet runtime not found; start ./start_dev.sh first')
 
     name = args.backend
     print(f'Waiting for {name} to be HEALTHY ...', flush=True)

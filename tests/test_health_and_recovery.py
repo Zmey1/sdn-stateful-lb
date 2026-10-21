@@ -1,11 +1,9 @@
 import json
 from unittest.mock import patch
 
-import pytest
 
-from controller.config import ALL, BACKENDS
+from controller.config import BACKENDS
 from controller.health_probe import probe_backend
-from controller.ofctl import OpenFlowError, parse_installed_weights
 from controller.policy import AdaptivePolicy
 from controller.policy_loop import connection_shares, initialize_policy, read_health
 
@@ -68,20 +66,6 @@ def test_draining_stops_new_selection_but_not_health_check():
     assert policy.summary()['b1']['state'] == 'DRAINING'
     policy.drain('b1', False)
     assert policy.evaluate(metrics(104), now=104, health=checks(104))['b1'] > 0
-
-
-def test_parse_group_weights_and_drop():
-    text = ('OFPST_GROUP_DESC reply (OF1.3) (xid=0x2):\n'
-            ' group_id=100,type=select,'
-            'bucket=weight:100,actions=ct(commit,table=30,zone=10,nat(dst=10.0.2.11:8080),exec(set_field:0x1->ct_mark)),'
-            'bucket=weight:150,actions=ct(commit,table=30,zone=10,nat(dst=10.0.2.13:8080),exec(set_field:0x1->ct_mark))\n')
-    assert parse_installed_weights(text) == {'b1': 100, 'b2': 0, 'b3': 150}
-    assert parse_installed_weights('group_id=100,type=select,bucket=actions=drop') == {
-        'b1': 0, 'b2': 0, 'b3': 0}
-    with pytest.raises(OpenFlowError):
-        parse_installed_weights('group_id=100,type=select,bucket=weight:100,actions=output:1')
-    with pytest.raises(OpenFlowError):
-        parse_installed_weights('group_id=99,type=select,bucket=actions=drop')
 
 
 def test_controller_restart_reads_installed_group_without_reinstalling(tmp_path):

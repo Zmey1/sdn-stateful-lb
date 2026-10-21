@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from .ofctl import show
+from .ofctl import OpenFlowError, show
 from .config import BRIDGE
 from .benchmark_modes import MODE_NAMES
 from .runtime import BACKEND_NAMES, atomic_json, pid_alive, read_dict, set_drain
@@ -60,7 +60,10 @@ def main():
         print(f'Benchmark mode requested: {args.target} (wait for status confirmation)')
         return
     if args.command == 'show':
-        print(show(args.bridge))
+        try:
+            print(show(args.bridge))
+        except OpenFlowError as exc:
+            p.error(str(exc))
         return
     if args.command in ('status', 'health'):
         if not args.runtime:

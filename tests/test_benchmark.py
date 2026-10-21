@@ -1,6 +1,6 @@
 import json
 import pytest
-from controller.benchmark_modes import read_mode, select_weights, MODE_NAMES
+from controller.benchmark_modes import read_mode, select_weights
 from experiments.benchmark_suite import (SLOW_DELAY_MS, percentile, summarize,
                                          scenario_schedule)
 from backend.server import injected_delay_ms
@@ -73,30 +73,3 @@ def test_percentiles_and_accounting():
     assert result['throughput_rps'] == 2
     assert result['p50_ms'] == 25
     assert result['b3'] == 2
-
-
-from controller.policy_loop import should_install_weights
-
-
-def test_mode_switch_bypasses_hysteresis():
-    current = {'b1': 101, 'b2': 99, 'b3': 100}
-    equal = {'b1': 100, 'b2': 100, 'b3': 100}
-    assert should_install_weights(current, equal, 'equal', True, False)
-    assert should_install_weights(current, equal, 'equal', False, False)
-
-
-def test_adaptive_small_drift_keeps_hysteresis():
-    current = {'b1': 101, 'b2': 99, 'b3': 100}
-    desired = {'b1': 100, 'b2': 100, 'b3': 100}
-    assert not should_install_weights(current, desired, 'adaptive', False, True)
-    assert should_install_weights(current, desired, 'adaptive', True, False)
-    assert not should_install_weights(desired, desired, 'equal', True, True)
-
-
-def test_adaptive_large_update_and_membership_change():
-    current = {'b1': 100, 'b2': 100, 'b3': 100}
-    desired = {'b1': 50, 'b2': 125, 'b3': 125}
-    assert should_install_weights(current, desired, 'adaptive', False, True)
-    assert not should_install_weights(current, desired, 'adaptive', False, False)
-    assert should_install_weights(current, {'b1': 0, 'b2': 150, 'b3': 150},
-                                  'adaptive', False, False)

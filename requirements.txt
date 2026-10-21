@@ -1,3 +1,5 @@
+ryu==4.34
+eventlet==0.30.2  # newest eventlet that Ryu 4.34 supports
 fastapi>=0.100,<1.0
 uvicorn>=0.22,<1.0
 pytest>=8.0

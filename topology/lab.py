@@ -1,10 +1,9 @@
 """One-bridge Mininet lab. Run as root: sudo $CONDA_PREFIX/bin/python -m topology.lab
 
-No controller participates in packet forwarding. Controller-style OpenFlow
-messages are pushed by ovs-ofctl; OVS performs selection, tracking and NAT.
+The Ryu controller (controller/lb_app.py) programs the switch over OpenFlow
+1.3 but never handles data packets: OVS performs selection, tracking and NAT.
 """
 import argparse
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -12,21 +11,64 @@ import sys
 import tempfile
 import time
 
-from controller.config import (ALL, BACKENDS, CLIENTS, PROBE, BRIDGE, GATEWAY_MAC,
+from controller.benchmark_modes import STATIC_CAPACITY
+from controller.config import (ALL, BACKENDS, PROBE, BRIDGE, GATEWAY_MAC,
                                CLIENT_GW, BACKEND_GW, VIP, VPORT)
-from controller.ofctl import install, ports_from_switch, update_weights
+from controller.lb_app import CONTROLLER_PORT
+from controller.runtime import atomic_json, read_dict
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def wait_for(path: Path, timeout: float, process=None):
+def wait_until(check, timeout: float, what: str, process=None):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-        if path.exists(): return
+        if check():
+            return
         if process is not None and process.poll() is not None:
-            raise RuntimeError(f'Experiment ended unexpectedly, code={process.returncode}')
-        time.sleep(.1)
-    raise TimeoutError(f'Timed out waiting for {path}')
+            raise RuntimeError(f'Process ended unexpectedly while waiting for {what}, '
+                               f'code={process.returncode}')
+        time.sleep(.2)
+    raise TimeoutError(f'Timed out waiting for {what}')
+
+
+def installed_weights(runtime: Path) -> dict:
+    status = read_dict(runtime / 'status.json')
+    if time.time() - status.get('timestamp', 0) >= 8:
+        return {}
+    return status.get('installed_weights') or {}
+
+
+def self_test(net, runtime: Path, env: dict, connections: int, controller) -> None:
+    """Open TCP sessions, change SELECT weights through the controller, and
+    verify every session keeps its backend and source port."""
+    equal = {b.name: 100 for b in BACKENDS}
+    atomic_json(runtime / 'benchmark_mode.json', {'mode': 'equal'})
+    wait_until(lambda: installed_weights(runtime) == equal, 90,
+               'all backends admitted with equal weights', controller)
+    ready, go, result = runtime / 'ready.json', runtime / 'go.flag', runtime / 'result.json'
+    cmd = [sys.executable, '-u', '-m', 'experiments.session_check',
+           '--connections', str(connections), '--ready', str(ready),
+           '--go', str(go), '--result', str(result)]
+    with (runtime / 'experiment.log').open('w') as log:
+        worker = net.get('h1').popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        wait_until(ready.exists, 30, 'test sessions', worker)
+        print('Live TCP sessions before weight change:', ready.read_text())
+        atomic_json(runtime / 'benchmark_mode.json', {'mode': 'capacity'})
+        wait_until(lambda: installed_weights(runtime) == STATIC_CAPACITY, 20,
+                   'controller to install new weights', controller)
+        go.touch()
+        worker.wait(timeout=30)
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        atomic_json(runtime / 'benchmark_mode.json', {'mode': 'adaptive'})
+    if result.exists():
+        print('PERSISTENCE RESULT:', result.read_text())
+    if worker.returncode:
+        raise RuntimeError(f'Persistence test failed: see {runtime / "experiment.log"}')
+    print('PASS: session identity and source ports stable across group MOD')
 
 
 def main():
@@ -36,19 +78,17 @@ def main():
     try:
         from mininet.net import Mininet
         from mininet.topo import Topo
-        from mininet.node import OVSSwitch
+        from mininet.node import OVSSwitch, RemoteController
         from mininet.cli import CLI
         from mininet.log import setLogLevel
     except ImportError as exc:
-        raise SystemExit('Mininet missing. See README: apt install mininet') from exc
+        raise SystemExit('Mininet missing. Run: sudo -E bash scripts/setup_ubuntu.sh') from exc
 
     p = argparse.ArgumentParser()
-    p.add_argument('--self-test', action='store_true', help='automated persistent-session test')
-    p.add_argument('--adaptive', action='store_true', help='start adaptive policy loop')
+    p.add_argument('--self-test', action='store_true',
+                   help='automated session-persistence test, then exit')
     p.add_argument('--connections', type=int, default=30)
     args = p.parse_args()
-    if args.adaptive and args.self_test:
-        p.error('Use --self-test separately from --adaptive for deterministic test')
 
     class LBTopo(Topo):
         def build(self):
@@ -59,112 +99,78 @@ def main():
 
     setLogLevel('info')
     runtime = Path(tempfile.mkdtemp(prefix='sdn-lb-'))
-    net = Mininet(topo=LBTopo(), switch=OVSSwitch, controller=None,
-                  autoSetMacs=False, autoStaticArp=False)
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(ROOT)
     procs = []
+
+    def start(cmd, log_name, host=None):
+        log = (runtime / log_name).open('w')
+        launcher = host.popen if host is not None else subprocess.Popen
+        process = launcher(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        log.close()
+        procs.append(process)
+        return process
+
+    # The controller listens before the switch exists; the switch connects
+    # to it during net.start() and receives the pipeline over OpenFlow.
+    controller = start([sys.executable, '-u', '-m', 'controller.lb_app',
+                        '--runtime', str(runtime), '--port', str(CONTROLLER_PORT)],
+                       'controller.log')
+    net = Mininet(topo=LBTopo(), switch=OVSSwitch,
+                  controller=RemoteController('c0', ip='127.0.0.1', port=CONTROLLER_PORT),
+                  autoSetMacs=False, autoStaticArp=False)
     try:
         net.start()
         # Static ARP is intentional: this OVS bridge is a strict
         # OpenFlow-programmed IPv4 gateway, with no NORMAL/ARP responder.
-        for e in (*CLIENTS, PROBE):
+        for e in ALL:
             h = net.get(e.name)
             dev = h.defaultIntf().name
-            h.cmd(f'ip neigh replace {CLIENT_GW} lladdr {GATEWAY_MAC} dev {dev} nud permanent')
-            h.cmd(f'ip route replace default via {CLIENT_GW} dev {dev}')
-        for e in BACKENDS:
-            h = net.get(e.name)
-            dev = h.defaultIntf().name
-            h.cmd(f'ip neigh replace {BACKEND_GW} lladdr {GATEWAY_MAC} dev {dev} nud permanent')
-            h.cmd(f'ip route replace default via {BACKEND_GW} dev {dev}')
+            gateway = BACKEND_GW if e in BACKENDS else CLIENT_GW
+            h.cmd(f'ip neigh replace {gateway} lladdr {GATEWAY_MAC} dev {dev} nud permanent')
+            h.cmd(f'ip route replace default via {gateway} dev {dev}')
 
         # Allows lab-only restarts of failed servers in the same Mininet
         # network namespace, even when the server worker itself has exited.
-        (runtime / 'host_pids.json').write_text(json.dumps(
-            {e.name: net.get(e.name).pid for e in ALL}))
-        ports = ports_from_switch(BRIDGE)
-        print('Actual OpenFlow ports:', ports)
-        # Bootstrap fail closed before starting any server; group weights will
-        # be made live immediately after all three healthy servers start.
-        install(ports, BRIDGE)
+        atomic_json(runtime / 'host_pids.json', {e.name: net.get(e.name).pid for e in ALL})
 
-        env = os.environ.copy()
-        env['PYTHONPATH'] = str(ROOT)
-        for e in BACKENDS:
-            p_backend = net.get(e.name).popen(
-                [sys.executable, '-u', '-m', 'backend.server', '--name', e.name,
-                 '--runtime', str(runtime)], env=env,
-                stdout=(runtime / f'{e.name}.log').open('w'),
-                stderr=subprocess.STDOUT)
-            procs.append(p_backend)
-        for e in BACKENDS:
-            wait_for(runtime / f'{e.name}.json', 12, procs[BACKENDS.index(e)])
+        backends = [start([sys.executable, '-u', '-m', 'backend.server', '--name', e.name,
+                           '--runtime', str(runtime)], f'{e.name}.log', net.get(e.name))
+                    for e in BACKENDS]
+        for e, process in zip(BACKENDS, backends):
+            wait_until((runtime / f'{e.name}.json').exists, 12, f'{e.name} telemetry', process)
 
-        if args.adaptive:
-            # Probe worker is independent of the policy/controller process.
-            # p1 can address each backend directly; production client h1/h2/h3
-            # cannot bypass the VIP or the SELECT group.
-            p_probe = net.get(PROBE.name).popen(
-                [sys.executable, '-u', '-m', 'controller.health_probe',
-                 '--runtime', str(runtime)], env=env,
-                stdout=(runtime / 'probe.log').open('w'),
-                stderr=subprocess.STDOUT)
-            procs.append(p_probe)
-            wait_for(runtime / 'health.json', 12, p_probe)
-            # Start the actual policy daemon, which gradually enables healthy
-            # members. No Packet-In or per-connection controller processing.
-            p_controller = subprocess.Popen(
-                [sys.executable, '-u', '-m', 'controller.policy_loop',
-                 '--runtime', str(runtime)], env=env,
-                stdout=(runtime / 'controller.log').open('w'),
-                stderr=subprocess.STDOUT)
-            procs.append(p_controller)
-            print('Adaptive policy loop started')
-        else:
-            update_weights({'b1': 100, 'b2': 100, 'b3': 100}, BRIDGE)
+        # The probe runs in its own namespace, independent of the controller.
+        # p1 can address each backend directly; clients h1/h2/h3 cannot
+        # bypass the VIP or the SELECT group.
+        probe = start([sys.executable, '-u', '-m', 'controller.health_probe',
+                       '--runtime', str(runtime)], 'probe.log', net.get(PROBE.name))
+        wait_until((runtime / 'health.json').exists, 12, 'health probe', probe)
+        wait_until(lambda: read_dict(runtime / 'status.json').get('switch_connected'), 20,
+                   'switch to connect to the Ryu controller', controller)
 
         print(f'VIP: http://{VIP}:{VPORT}/ | Logs/metrics: {runtime}')
         if args.self_test:
-            ready, go, result = (runtime / 'ready.json', runtime / 'go.flag',
-                                  runtime / 'result.json')
-            cmd = [sys.executable, '-u', '-m', 'experiments.session_check',
-                   '--connections', str(args.connections), '--ready', str(ready),
-                   '--go', str(go), '--result', str(result)]
-            worker = net.get('h1').popen(cmd, env=env,
-                stdout=(runtime / 'experiment.log').open('w'),
-                stderr=subprocess.STDOUT)
-            procs.append(worker)
-            wait_for(ready, 30, worker)
-            print('Live TCP sessions before weight change:', ready.read_text())
-            update_weights({'b1': 1, 'b2': 150, 'b3': 1}, BRIDGE)
-            go.touch()
-            worker.wait(timeout=30)
-            if result.exists():
-                print('PERSISTENCE RESULT:', result.read_text())
-            if worker.returncode:
-                raise RuntimeError(f'Persistence test failed: see {runtime / "experiment.log"}')
-            print('PASS: session identity and source ports stable across group MOD')
+            self_test(net, runtime, env, args.connections, controller)
         else:
             print(f'Try: h1 curl -s http://{VIP}:{VPORT}/work')
-            print('In another terminal, run:')
-            print(f'sudo {sys.executable} -m controller.cli mode equal --runtime {runtime}')
+            print(f'Status: sudo {sys.executable} -m controller.cli status --runtime {runtime}')
             print('Type exit to shut down this Mininet lab.')
             CLI(net)
     finally:
         # CLI-started replacement backend workers are recorded separately.
-        registry = runtime / 'restarted_pids.json'
-        try:
-            for pid in json.loads(registry.read_text()).values():
-                try:
-                    os.kill(int(pid), 15)
-                except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                    pass
-        except (OSError, ValueError):
-            pass
+        for pid in read_dict(runtime / 'restarted_pids.json').values():
+            try:
+                os.kill(int(pid), 15)
+            except (ProcessLookupError, PermissionError, ValueError, TypeError):
+                pass
         for process in reversed(procs):
             if process.poll() is None:
                 process.terminate()
-                try: process.wait(timeout=3)
-                except subprocess.TimeoutExpired: process.kill()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
         net.stop()
         print('Lab finished. Diagnostics preserved at', runtime)
 
