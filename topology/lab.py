@@ -6,6 +6,7 @@ The Ryu controller (controller/lb_app.py) programs the switch over OpenFlow
 import argparse
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,24 @@ def wait_until(check, timeout: float, what: str, process=None):
                                f'code={process.returncode}')
         time.sleep(.2)
     raise TimeoutError(f'Timed out waiting for {what}')
+
+
+def port_listening(port: int) -> bool:
+    with socket.socket() as s:
+        s.settimeout(.5)
+        return s.connect_ex(('127.0.0.1', port)) == 0
+
+
+def refuse_if_lab_running() -> None:
+    """A second lab must not start beside a live one. Mininet deletes
+    same-named veths before creating its own (removing the live lab's switch
+    ports), and Ryu listens with SO_REUSEPORT, so a second controller would
+    silently share port 6653 and could take over the switch."""
+    bridge = subprocess.run(['ovs-vsctl', 'br-exists', BRIDGE]).returncode == 0
+    if bridge or port_listening(CONTROLLER_PORT):
+        raise SystemExit(f'Another lab is running (OVS bridge {BRIDGE} or port '
+                         f'{CONTROLLER_PORT} in use). Type exit at its mininet> '
+                         'prompt first. If it crashed: sudo mn -c')
 
 
 def installed_weights(runtime: Path) -> dict:
@@ -89,6 +108,7 @@ def main():
                    help='automated session-persistence test, then exit')
     p.add_argument('--connections', type=int, default=30)
     args = p.parse_args()
+    refuse_if_lab_running()
 
     class LBTopo(Topo):
         def build(self):
@@ -105,21 +125,31 @@ def main():
 
     def start(cmd, log_name, host=None):
         log = (runtime / log_name).open('w')
-        launcher = host.popen if host is not None else subprocess.Popen
-        process = launcher(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        if host is not None:
+            process = host.popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        else:
+            # Own session, no terminal: otherwise the process shares the
+            # Mininet CLI's foreground job and terminal job control can
+            # stop it (state T), freezing the controller.
+            process = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=log, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
         log.close()
         procs.append(process)
         return process
 
-    # The controller listens before the switch exists; the switch connects
-    # to it during net.start() and receives the pipeline over OpenFlow.
-    controller = start([sys.executable, '-u', '-m', 'controller.lb_app',
-                        '--runtime', str(runtime), '--port', str(CONTROLLER_PORT)],
-                       'controller.log')
-    net = Mininet(topo=LBTopo(), switch=OVSSwitch,
-                  controller=RemoteController('c0', ip='127.0.0.1', port=CONTROLLER_PORT),
-                  autoSetMacs=False, autoStaticArp=False)
+    net = None
     try:
+        # The controller listens before the switch exists; the switch connects
+        # to it during net.start() and receives the pipeline over OpenFlow.
+        controller = start([sys.executable, '-u', '-m', 'controller.lb_app',
+                            '--runtime', str(runtime), '--port', str(CONTROLLER_PORT)],
+                           'controller.log')
+        wait_until(lambda: port_listening(CONTROLLER_PORT), 15,
+                   'Ryu controller to listen', controller)
+        net = Mininet(topo=LBTopo(), switch=OVSSwitch,
+                      controller=RemoteController('c0', ip='127.0.0.1', port=CONTROLLER_PORT),
+                      autoSetMacs=False, autoStaticArp=False)
         net.start()
         # Static ARP is intentional: this OVS bridge is a strict
         # OpenFlow-programmed IPv4 gateway, with no NORMAL/ARP responder.
@@ -171,7 +201,8 @@ def main():
                     process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     process.kill()
-        net.stop()
+        if net is not None:
+            net.stop()
         print('Lab finished. Diagnostics preserved at', runtime)
 
 

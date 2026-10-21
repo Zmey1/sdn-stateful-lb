@@ -87,6 +87,8 @@ def test_fresh_switch_gets_pipeline_and_fail_closed_group(app):
     assert len(flows) > 20
     assert len(groups) == 1 and groups[0].command == ofp.OFPGC_ADD
     assert groups[0].buckets[0].actions == []  # drop bucket
+    # Flows that output to the group are rejected unless it already exists.
+    assert datapath.sent.index(groups[0]) < datapath.sent.index(flows[0])
     assert app.installed == {n: 0 for n in NAMES}
     assert app.loop is not None
 

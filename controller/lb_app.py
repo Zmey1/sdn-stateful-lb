@@ -17,6 +17,8 @@ import fcntl
 import os
 from pathlib import Path
 import sys
+import time
+import traceback
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -29,6 +31,7 @@ from .config import BACKENDS
 from .openflow import (flow_mods, group_counters, group_mod, ports_from_desc,
                        weights_from_group_desc)
 from .policy_loop import PolicyLoop
+from .runtime import atomic_json, read_dict
 
 RUNTIME_ENV = 'SDN_LB_RUNTIME'
 INTERVAL = 2.0
@@ -89,11 +92,12 @@ class LoadBalancer(app_manager.RyuApp):
             return
         if weights is None:
             # Fresh switch: install the pipeline, new connections fail-closed
-            # until the policy admits healthy backends.
+            # until the policy admits healthy backends. The group goes first:
+            # OVS rejects a flow whose group does not exist (BAD_OUT_GROUP).
             ofproto = datapath.ofproto
+            datapath.send_msg(group_mod(datapath, {}, ofproto.OFPGC_ADD))
             for message in flow_mods(datapath, self.ports):
                 datapath.send_msg(message)
-            datapath.send_msg(group_mod(datapath, {}, ofproto.OFPGC_ADD))
             weights = {b.name: 0 for b in BACKENDS}
             print('Installed pipeline on fresh switch', flush=True)
         self.installed = weights
@@ -123,26 +127,46 @@ class LoadBalancer(app_manager.RyuApp):
     # Control loop ----------------------------------------------------------
 
     def _control_loop(self):
+        # hub.spawn logs an uncaught exception once and ends the thread, which
+        # would leave a live process with a frozen status.json. Keep cycling
+        # and publish the error instead.
+        last_error = ''
         while True:
             hub.sleep(INTERVAL)
             if self.loop is None:
                 continue
-            datapath = self.datapath
-            if datapath is not None:
-                datapath.send_msg(datapath.ofproto_parser.OFPGroupStatsRequest(
-                    datapath, 0, datapath.ofproto.OFPG_ALL))
             try:
-                desired = self.loop.step(self.installed, self.counters,
-                                         connected=datapath is not None)
-            except OSError as exc:
-                print(f'Runtime file error: {exc}', flush=True)
-                continue
-            if desired is not None and datapath is not None:
-                # Group MOD rewrites buckets only: flows and conntrack entries
-                # are untouched. Read the group back to confirm.
-                datapath.send_msg(group_mod(datapath, desired))
-                self.installed = dict(desired)
-                self._request_group_desc(datapath)
+                self._control_step()
+                last_error = ''
+            except Exception:
+                error = traceback.format_exc()
+                if error != last_error:
+                    print(f'Control step failed:\n{error}', flush=True)
+                last_error = error
+                self._publish_error(error.strip().splitlines()[-1])
+
+    def _publish_error(self, message: str):
+        try:
+            status = read_dict(self.runtime / 'status.json')
+            status.update({'timestamp': time.time(), 'controller_pid': os.getpid(),
+                           'loop_error': message})
+            atomic_json(self.runtime / 'status.json', status)
+        except OSError:
+            pass
+
+    def _control_step(self):
+        datapath = self.datapath
+        if datapath is not None:
+            datapath.send_msg(datapath.ofproto_parser.OFPGroupStatsRequest(
+                datapath, 0, datapath.ofproto.OFPG_ALL))
+        desired = self.loop.step(self.installed, self.counters,
+                                 connected=datapath is not None)
+        if desired is not None and datapath is not None:
+            # Group MOD rewrites buckets only: flows and conntrack entries
+            # are untouched. Read the group back to confirm.
+            datapath.send_msg(group_mod(datapath, desired))
+            self.installed = dict(desired)
+            self._request_group_desc(datapath)
 
 
 def main():

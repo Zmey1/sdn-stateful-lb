@@ -82,6 +82,9 @@ if ! "$CONDA_PY" - "$PORT" <<'PY'
 import socket
 import sys
 s = socket.socket()
+# Like uvicorn: ignore TIME_WAIT sockets left by the previous dashboard's
+# browser polling. Linux still refuses the bind if a server is listening.
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     s.bind(('127.0.0.1', int(sys.argv[1])))
 except OSError as exc:

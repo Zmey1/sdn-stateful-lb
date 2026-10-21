@@ -98,7 +98,10 @@ class Monitor:
             summary = status.get('backends') or {}
             observed = status.get('observed_share') or {}
             status_age = max(0.0, now - finite_float(status.get('timestamp'), 0))
-            controller_online = status_age < 8 and pid_alive(status.get('controller_pid'))
+            # A running process whose control step keeps failing is not online.
+            loop_error = str(status.get('loop_error') or '')[:300]
+            controller_online = (status_age < 8 and not loop_error
+                                 and pid_alive(status.get('controller_pid')))
             servers = []
             counts = {}
             for backend in BACKENDS:
@@ -147,6 +150,7 @@ class Monitor:
             controller = {
                 'pid': status.get('controller_pid'),
                 'alive': controller_online,
+                'error': loop_error,
                 'age_s': round(status_age, 1) if status else None,
                 'mode': status.get('benchmark_mode', 'unknown'),
                 'synced': bool(status) and installed == desired,

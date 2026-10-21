@@ -6,7 +6,7 @@ set -euo pipefail
 if [[ $(id -u) -ne 0 ]]; then echo 'Run: sudo -E bash scripts/setup_ubuntu.sh'; exit 1; fi
 if [[ -z "${CONDA_PREFIX:-}" ]]; then echo 'Activate the env first: conda activate sdn-ryu'; exit 1; fi
 apt-get update
-apt-get install -y mininet openvswitch-switch iproute2 curl util-linux
+apt-get install -y mininet openvswitch-switch iproute2 curl util-linux rsync
 systemctl enable --now openvswitch-switch || true
 
 SITE="$("$CONDA_PREFIX/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"

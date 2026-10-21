@@ -77,15 +77,25 @@ converge to the capacity ratio (≈ 43 : 128 : 128) in about 8 s and stay there.
 Against the real backend servers the same controller converged in about 20 s to
 ≈ 52 : 121 : 127, with all three backends near 80 % load per worker.
 
+## Requirements
+
+- Ubuntu 22.04 or newer (Mininet and Open vSwitch need Linux and `sudo`)
+- Conda (Anaconda or Miniconda)
+- Python 3.9 in a Conda env named `sdn-ryu` (Ryu 4.34 does not support newer Pythons)
+
 ## Setup (once)
 
 ```bash
+git clone <this repo> sdn-stateful-lb && cd sdn-stateful-lb
+conda create -n sdn-ryu python=3.9 -y
 conda activate sdn-ryu
 sudo -E bash scripts/setup_ubuntu.sh   # apt packages, Mininet into the env, requirements
 python -m pytest                        # 55 tests, no root needed
 ```
 
-Every component (Mininet lab, Ryu, probe, dashboard, experiments) runs on the
+`setup_ubuntu.sh` installs Mininet and Open vSwitch with apt, copies Mininet's
+Python package into the env, and installs `requirements.txt`, so every
+component (Mininet lab, Ryu, probe, dashboard, experiments) runs on the
 `sdn-ryu` interpreter.
 
 ## Run
@@ -95,8 +105,16 @@ conda activate sdn-ryu
 ./start_dev.sh            # Mininet + Ryu + probe + dashboard in one terminal
 ```
 
-Open http://127.0.0.1:8765. Type `exit` at the `mininet>` prompt to stop
-everything. In another terminal:
+1. Enter your password when `sudo` asks.
+2. Wait for `[FlowScope] SDN network + dashboard ready`.
+3. Open http://127.0.0.1:8765. The header shows **SYSTEM ONLINE**, and within
+   about 10 s b1, b2 and b3 go DOWN → RECOVERING → HEALTHY.
+4. Follow the four steps on the dashboard (or the demo below).
+5. Type `exit` at the `mininet>` prompt to stop everything.
+
+Only one lab can run at a time; a second `start_dev.sh` or `topology.lab`
+refuses to start while one is running. To inspect a running lab, use another
+terminal:
 
 ```bash
 RUNTIME="$(cat .dev/current_runtime)"
@@ -106,8 +124,19 @@ sudo "$PY" -m controller.cli show                          # OVS groups/flows
 sudo tail -f "$RUNTIME/controller.log"
 ```
 
+Traffic by hand, at the `mininet>` prompt: `h1 curl -s http://10.0.3.100:8080/work`.
+
 Options: `./start_dev.sh --read-only`, `--port 8766`, `--bench-root DIR`.
 Without the dashboard: `sudo "$PY" -m topology.lab`.
+
+**Self-test** (after exiting any running lab): starts its own lab, opens 30 TCP
+connections, changes the weights, and checks that every connection keeps its
+backend. It ends with `PASS: session identity and source ports stable across
+group MOD`.
+
+```bash
+sudo "$CONDA_PREFIX/bin/python" -m topology.lab --self-test
+```
 
 ## Presentation demo (about 5 minutes)
 
@@ -145,7 +174,8 @@ sudo "$PY" -m experiments.recovery_check --runtime "$RUNTIME" --backend b1
 # under $RUNTIME/bench_results/; the dashboard shows the newest summary.
 sudo "$PY" -m experiments.benchmark_suite --runtime "$RUNTIME" --repeats 3
 
-# Session persistence across weight changes (fresh lab, exits when done).
+# Session persistence across weight changes. Starts its own lab, so first exit
+# the running one (it refuses to start beside it); exits when done.
 sudo "$PY" -m topology.lab --self-test --connections 30
 ```
 
@@ -179,8 +209,10 @@ are rejected, and controls lock while a benchmark runs.
 ## Troubleshooting
 
 - `OVS bridge s1 already exists` — exit the old lab; if it crashed, `sudo mn -c`.
-- Controller offline — check `$RUNTIME/controller.log` (port 6653 in use?
-  another controller holding `controller.lock`?).
+- `Another lab is running` — exit the other lab first; if it crashed, `sudo mn -c`.
+- `Dashboard port unavailable` — a dashboard is still running; stop it or pass `--port 8766`.
+- Controller offline or CONTROLLER ERROR — read `sudo tail -80 "$RUNTIME/controller.log"`;
+  a failing control step is logged there with its traceback.
 - `sdn-ryu Python cannot import Mininet` — rerun `sudo -E bash scripts/setup_ubuntu.sh`.
 - 0 req/s — expected until you generate traffic; probes are not counted.
 - No benchmark table — run the suite or pass `--bench-root` to `start_dev.sh`.
